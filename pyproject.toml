@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulso-transmi"
+version = "0.1.0"
+description = "SDK estudiantil para el reto MLOps Pulso TransMi"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+  "httpx>=0.28,<1",
+  "pandas>=2.2,<3",
+]
+
+[project.optional-dependencies]
+ml = ["scikit-learn>=1.5,<2", "lightgbm>=4.6,<5", "joblib>=1.4,<2", "numpy>=1.26,<3", "matplotlib>=3.9,<4", "jsonschema>=4.23,<5"]
+dev = ["pytest>=8,<9"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+pulso_transmi = ["submission_schema.json"]

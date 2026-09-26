@@ -1,0 +1,99 @@
+"""Ejecución remota con identidad verificada y resultado auditable."""
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+import uuid
+from pathlib import Path
+
+import httpx
+
+from .client import DEFAULT_BASE_URL
+from .collector import collect
+from .forecaster import forecast
+from .operational import load_env
+from .persistence import RemoteStore
+from .prepare_submission import check_current_cycle
+
+EXPECTED_PARTICIPANT = os.getenv('EXPECTED_PARTICIPANT_ID', '')
+
+
+def execute(store, api, *, submit=False, token=None):
+    result = {'started_at': datetime.now(timezone.utc).isoformat(), 'submit_requested': submit,
+              'attempt_id': str(uuid.uuid4())}
+    store.start_attempt(result['attempt_id'], submit)
+    try:
+        if submit:
+            if not token:
+                raise ValueError('Falta PULSO_API_KEY')
+            response = api.get('/v1/me', headers={'Authorization': f'Bearer {token}'})
+            response.raise_for_status()
+            identity = response.json()
+            if identity['participant_id'] != EXPECTED_PARTICIPANT:
+                raise ValueError('La API key no pertenece al participante esperado')
+            result['participant'] = identity['display_name']
+        result['collector'] = collect(store, api)
+        cycle = check_current_cycle(DEFAULT_BASE_URL, api)
+        if cycle is not None:
+            result['cycle_id'] = cycle['cycle_id']
+            store.observe_cycle(cycle)
+            result['forecast'] = forecast(store, api, submit=submit, token=token, cycle=cycle)
+        else:
+            result['forecast'] = {'status': 'no_open_cycle', 'submitted': False}
+    except Exception as exc:
+        result.update(status='error', error_type=type(exc).__name__)
+    # Evaluación posterior al envío para no gastar la ventana en métricas.
+    # También evaluar si falló el pronóstico, siempre que la ingesta terminó.
+    if 'collector' in result:
+        try:
+            result['evaluation'] = store.evaluate_deliveries()
+        except Exception as exc:
+            result.update(status='error', evaluation_error_type=type(exc).__name__)
+    try:
+        store.finish_attempt(result['attempt_id'], result)
+    except Exception as exc:
+        result.update(status='error', persistence_error_type=type(exc).__name__)
+    return result
+
+
+def save_report(result, path):
+    # El historial detallado queda en Supabase, no en logs/artefactos públicos.
+    forecast_result = result.get('forecast', {})
+    safe = {'checked_at': datetime.now(timezone.utc).isoformat(),
+            'status': result.get('status', forecast_result.get('status', 'error')),
+            'submitted': forecast_result.get('submitted', False),
+            'evaluation_complete': result.get('evaluation', {}).get('complete_cycles'),
+            'evaluation_pending': result.get('evaluation', {}).get('pending_cycles')}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(safe) + '\n')
+    print(json.dumps(safe), flush=True)
+    if os.getenv('GITHUB_STEP_SUMMARY'):
+        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+            stream.write(f"- {safe['checked_at']}: {safe['status']}; envío nuevo={safe['submitted']}\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--submit', action='store_true')
+    parser.add_argument('--report', type=Path, required=True)
+    args = parser.parse_args()
+    load_env(Path('.env'))
+    store = None
+    try:
+        store = RemoteStore()
+        with httpx.Client(base_url=DEFAULT_BASE_URL, timeout=60) as api:
+            result = execute(store, api, submit=args.submit, token=os.getenv('PULSO_API_KEY'))
+    except Exception as exc:
+        # No incluir mensajes/headers que pudieran contener credenciales.
+        save_report({'status': 'error', 'error_type': type(exc).__name__}, args.report)
+        raise SystemExit(1) from None
+    finally:
+        if store is not None:
+            store.close()
+    save_report(result, args.report)
+    if result.get('status') == 'error':
+        raise SystemExit(1)
+
+
+if __name__ == '__main__':
+    main()

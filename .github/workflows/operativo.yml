@@ -1,0 +1,76 @@
+name: Entregas automaticas
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'Duración de esta sesión, 1..300 minutos; relevo hasta AUTOMATION_UNTIL'
+        type: number
+        default: 300
+  schedule:
+    # Respaldo: antes y dentro de la ventana aproximada :35–:05 (UTC/Bogotá).
+    - cron: '2,32,47 * * * *'
+concurrency:
+  group: entregas-publicas
+  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: write
+jobs:
+  vigilar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 315
+    env:
+      AUTOMATION_UNTIL: ${{ vars.AUTOMATION_UNTIL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Comprobar fecha de finalizacion
+        id: gate
+        env:
+          REQUESTED_MINUTES: ${{ inputs.minutes || 300 }}
+        run: python3 scripts/session_gate.py
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: requirements-operativo.txt
+      - name: Instalar runtime probado
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          python -m pip install -r requirements-operativo.txt
+          python -m pip install --no-deps .
+      - name: Consultar e inferir cada dos minutos
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
+          EXPECTED_PARTICIPANT_ID: ${{ secrets.EXPECTED_PARTICIPANT_ID }}
+          REQUESTED_MINUTES: ${{ steps.gate.outputs.minutes }}
+        run: |
+          # Recalcular el límite después de instalar, para respetar la fecha final.
+          MINUTES=$(python3 -c 'import os; from datetime import datetime, timezone; from scripts.session_gate import allowed_minutes; print(allowed_minutes(os.environ["AUTOMATION_UNTIL"],os.environ["REQUESTED_MINUTES"],datetime.now(timezone.utc)))')
+          cd "$RUNNER_TEMP"
+          if [ "$MINUTES" -gt 0 ]; then
+            python -m pulso_transmi.watch --submit --minutes "$MINUTES" --interval 120 --report "$RUNNER_TEMP/estado.json"
+          fi
+      - name: Pedir relevo o finalizar campana
+        if: ${{ always() && !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REQUESTED_MINUTES: '300'
+        run: |
+          # Nueva ejecución por workflow_dispatch: no depende del cron horario.
+          MINUTES=$(python3 -c 'import os; from datetime import datetime, timezone; from scripts.session_gate import allowed_minutes; print(allowed_minutes(os.environ["AUTOMATION_UNTIL"],300,datetime.now(timezone.utc)))')
+          if [ "$MINUTES" -gt 0 ]; then
+            for attempt in 1 2 3; do
+              if gh workflow run operativo.yml --ref main -f minutes=300; then exit 0; fi
+              sleep 20
+            done
+            exit 1
+          else
+            gh workflow disable operativo.yml
+          fi
