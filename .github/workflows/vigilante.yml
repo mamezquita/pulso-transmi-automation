@@ -1,0 +1,49 @@
+name: Vigilante
+# Independiente de las entregas: si la cadena de sesiones muere, la relanza.
+# Si falla (rojo), GitHub envía correo: revisar Actions.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '20,50 * * * *'
+concurrency:
+  group: vigilante
+  cancel-in-progress: true
+permissions:
+  contents: read
+  actions: write
+jobs:
+  revisar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Diagnosticar
+        id: diag
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          AUTOMATION_UNTIL: ${{ vars.AUTOMATION_UNTIL }}
+        run: python3 scripts/watchdog.py
+      - name: Relanzar sesion caida
+        if: steps.diag.outputs.status == 'stalled'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh workflow enable operativo.yml || true
+          gh workflow run operativo.yml --ref main -f minutes=300
+          echo "::error::No hubo intentos en 20 minutos; se relanzó la sesión."
+          exit 1
+      - name: Alertar hora sin entrega
+        if: steps.diag.outputs.status == 'no_recent_delivery'
+        run: |
+          echo "::error::Sin entrega aceptada en 90 minutos. Revisar la ejecución activa."
+          exit 1
+      - name: Apagar vigilante al terminar la campana
+        if: steps.diag.outputs.status == 'campaign_over'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow disable vigilante.yml
