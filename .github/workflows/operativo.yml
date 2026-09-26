@@ -30,6 +30,14 @@ jobs:
         env:
           REQUESTED_MINUTES: ${{ inputs.minutes || 300 }}
         run: python3 scripts/session_gate.py
+      - name: Reservar relevo desde el inicio
+        # Queda en cola por concurrency: si esta sesion muere, el relevo arranca solo.
+        if: steps.gate.outputs.enabled == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run operativo.yml --ref main -f minutes=300
       - uses: actions/setup-python@v5
         if: steps.gate.outputs.enabled == 'true'
         with:
