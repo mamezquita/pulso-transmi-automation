@@ -4,7 +4,7 @@ name: Vigilante
 on:
   workflow_dispatch:
   schedule:
-    - cron: '20,50 * * * *'
+    - cron: '8,23,38,53 * * * *'
 concurrency:
   group: vigilante
   cancel-in-progress: true
