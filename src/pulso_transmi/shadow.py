@@ -1,0 +1,79 @@
+"""Modo sombra versionado: calcula pronósticos alternativos y los guarda aparte.
+
+Nunca reserva ni envía. Cada versión (tabla version_sombra) nombra un método de
+METHODS y sus parámetros; ambos son inmutables en la base. Solo se usan datos con
+observado_en <= data_cutoff, igual que el envío real.
+"""
+import os
+
+import numpy as np
+import pandas as pd
+
+from .prepare_submission import timestamp
+
+STEP = pd.Timedelta(minutes=15)
+
+
+def modelo_base(base, targets, history, model, cutoff):
+    """Control: el modelo activo tal como se envía (debe coincidir con lo entregado)."""
+    return np.round(base), {}
+
+
+def ratio_ultima_hora(base, targets, history, model, cutoff, *, ventana_obs=4,
+                      limite_min=0.5, limite_max=2.0):
+    """Modelo × (Σ real / Σ modelo) de las últimas `ventana_obs` observaciones por estación."""
+    since = cutoff - ventana_obs * STEP
+    past = history[(history.observed_at > since) & (history.observed_at <= cutoff)]
+    ratios, fallback = {}, []
+    if not past.empty:
+        past = past.assign(model=model.predict(past[['station_id', 'observed_at']]))
+        for sid, g in past.groupby('station_id'):
+            if len(g) == ventana_obs and g.model.sum() > 0:
+                ratios[sid] = float(np.clip(g.demand.sum() / g.model.sum(), limite_min, limite_max))
+    for sid in targets.station_id.unique():
+        if sid not in ratios:
+            ratios[sid] = 1.0
+            fallback.append(sid)
+    factor = targets.station_id.map(ratios).to_numpy(dtype=float)
+    return np.round(np.maximum(base * factor, 0)), {
+        'ratios': {k: round(v, 4) for k, v in sorted(ratios.items())}, 'sin_datos': sorted(fallback)}
+
+
+METHODS = {'modelo_base': modelo_base, 'ratio_ultima_hora': ratio_ultima_hora}
+
+
+def run_shadow(store, cycle):
+    """Calcula las versiones en sombra que falten para este ciclo. Idempotente."""
+    versions = [v for v in store.shadow_versions() if v['estado'] == 'sombra']
+    done = store.shadow_done(cycle['cycle_id'])
+    pending = [v for v in versions if v['version'] not in done]
+    unknown = sorted(v['version'] for v in pending if v['metodo'] not in METHODS)
+    pending = [v for v in pending if v['metodo'] in METHODS]
+    if not pending:
+        return {'status': 'up_to_date', 'unknown_method': unknown}
+    record = store.active_model()
+    model = store.load_model(record)
+    cutoff = timestamp(cycle['data_cutoff'])
+    targets = pd.DataFrame(cycle['targets'])[['station_id', 'target_at']]
+    base = np.asarray(model.predict(targets.rename(columns={'target_at': 'observed_at'})), dtype=float)
+    window = max(int(v['parametros'].get('ventana_obs', 0)) for v in pending)
+    history = pd.DataFrame(columns=['station_id', 'observed_at', 'demand'])
+    if window:
+        rows = store.observations_window(cutoff - window * STEP, cutoff)
+        if rows:
+            history = pd.DataFrame(rows)
+            history['observed_at'] = pd.to_datetime(history.observed_at, utc=True)
+            history = history[history.observed_at <= cutoff]  # doble barrera contra fuga
+    computed = []
+    for v in pending:
+        values, diag = METHODS[v['metodo']](base, targets, history, model, cutoff, **v['parametros'])
+        if not np.isfinite(values).all():
+            raise ValueError(f"Versión {v['version']} produjo valores no finitos")
+        store.save_shadow({
+            'ciclo_id': cycle['cycle_id'], 'version': v['version'],
+            'modelo_sha256': record['sha256'], 'codigo': os.getenv('GITHUB_SHA'),
+            'data_cutoff': cycle['data_cutoff'], 'diagnostico': diag,
+            'predicciones': [{'station_id': s, 'target_at': t, 'value': float(x)}
+                             for s, t, x in zip(targets.station_id, targets.target_at, values)]})
+        computed.append(v['version'])
+    return {'status': 'computed', 'versions': computed, 'unknown_method': unknown}

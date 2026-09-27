@@ -94,5 +94,24 @@ class RemoteStore:
             headers={'Prefer': 'resolution=ignore-duplicates'},
             json={'ciclo_id': cycle['cycle_id'], 'contrato': cycle})
 
+    def shadow_versions(self):
+        return self.rows('version_sombra', select='version,metodo,parametros,estado', order='version.asc')
+
+    def shadow_done(self, cycle_id):
+        rows = self.rows('pronostico_sombra', select='version', ciclo_id='eq.' + cycle_id)
+        return {r['version'] for r in rows}
+
+    def observations_window(self, start, end):
+        # Dos filtros sobre la misma columna: (start, end]; nunca datos posteriores al corte.
+        rows = self.request('GET', '/rest/v1/observaciones_disponibles', params=[
+            ('select', 'estacion_id,observado_en,demanda'),
+            ('observado_en', 'gt.' + start.isoformat()), ('observado_en', 'lte.' + end.isoformat())]).json()
+        return [{'station_id': r['estacion_id'], 'observed_at': r['observado_en'], 'demand': r['demanda']}
+                for r in rows]
+
+    def save_shadow(self, row):
+        self.request('POST', '/rest/v1/pronostico_sombra', params={'on_conflict': 'ciclo_id,version'},
+                     headers={'Prefer': 'resolution=ignore-duplicates'}, json=row)
+
     def evaluate_deliveries(self):
         return self.rpc('evaluar_entregas')

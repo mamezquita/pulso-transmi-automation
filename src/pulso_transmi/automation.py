@@ -15,6 +15,7 @@ from .operational import load_env
 from .persistence import RemoteStore
 from .contract import ContractError
 from .prepare_submission import check_current_cycle
+from .shadow import run_shadow
 
 EXPECTED_PARTICIPANT = os.getenv('EXPECTED_PARTICIPANT_ID', '')
 
@@ -23,6 +24,7 @@ def execute(store, api, *, submit=False, token=None):
     result = {'started_at': datetime.now(timezone.utc).isoformat(), 'submit_requested': submit,
               'attempt_id': str(uuid.uuid4())}
     store.start_attempt(result['attempt_id'], submit)
+    cycle = None
     try:
         if submit:
             if not token:
@@ -50,6 +52,12 @@ def execute(store, api, *, submit=False, token=None):
             result['forecast'] = {'status': 'no_open_cycle', 'submitted': False}
     except Exception as exc:
         result.update(status='error', error_type=type(exc).__name__)
+    # Sombra después del envío: calcula versiones alternativas sin reservar ni enviar.
+    if cycle is not None:
+        try:
+            result['shadow'] = run_shadow(store, cycle)
+        except Exception as exc:
+            result['shadow'] = {'status': 'error', 'error_type': type(exc).__name__}
     # Evaluación posterior al envío para no gastar la ventana en métricas.
     # También evaluar si falló el pronóstico, siempre que la ingesta terminó.
     if 'collector' in result:
@@ -73,7 +81,8 @@ def save_report(result, path):
             'evaluation_complete': result.get('evaluation', {}).get('complete_cycles'),
             'evaluation_pending': result.get('evaluation', {}).get('pending_cycles'),
             'degraded': result.get('degraded', False),
-            'quarantined': result.get('collector', {}).get('quarantined', 0)}
+            'quarantined': result.get('collector', {}).get('quarantined', 0),
+            'shadow': result.get('shadow', {}).get('status')}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(safe) + '\n')
     print(json.dumps(safe), flush=True)
