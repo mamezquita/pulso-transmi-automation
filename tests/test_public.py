@@ -27,3 +27,12 @@ def test_campaign_deadline():
     assert gate.allowed_minutes('2026-09-25T00:00:00Z',300,now) == 0
     with pytest.raises(ValueError): gate.allowed_minutes('2026-10-10',300,now)
     with pytest.raises(ValueError): gate.allowed_minutes('2026-10-10T00:00:00Z',301,now)
+
+
+def test_public_report_shows_quarantine_count_but_never_rows(tmp_path):
+    path = tmp_path/'report.json'
+    save_report({'degraded': True, 'collector': {'quarantined': 2,
+        'quarantine': [{'row': {'station_id': 'PRIVATE_ROW'}, 'reason': 'x'}]}}, path)
+    report = json.loads(path.read_text())
+    assert report['quarantined'] == 2 and report['degraded'] is True
+    assert 'PRIVATE' not in path.read_text()

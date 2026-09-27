@@ -17,6 +17,7 @@ import pandas as pd
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 
 from .client import DEFAULT_BASE_URL
+from .contract import normalize_cycle_contract
 
 
 def timestamp(value):
@@ -103,7 +104,8 @@ def check_current_cycle(base_url, client):
     if response.status_code==404 and response.json().get('detail',{}).get('code')=='no_open_cycle':
         return None
     response.raise_for_status()
-    return response.json()
+    # Formatos alternativos de fecha/tipos se traducen aquí; lo ambiguo se rechaza.
+    return normalize_cycle_contract(response.json())
 
 
 def demo_inputs(model):

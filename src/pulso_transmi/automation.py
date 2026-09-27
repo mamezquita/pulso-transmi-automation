@@ -13,6 +13,7 @@ from .collector import collect
 from .forecaster import forecast
 from .operational import load_env
 from .persistence import RemoteStore
+from .contract import ContractError
 from .prepare_submission import check_current_cycle
 
 EXPECTED_PARTICIPANT = os.getenv('EXPECTED_PARTICIPANT_ID', '')
@@ -32,7 +33,14 @@ def execute(store, api, *, submit=False, token=None):
             if identity['participant_id'] != EXPECTED_PARTICIPANT:
                 raise ValueError('La API key no pertenece al participante esperado')
             result['participant'] = identity['display_name']
-        result['collector'] = collect(store, api)
+        try:
+            result['collector'] = collect(store, api)
+        except Exception as exc:
+            # La ingesta nunca bloquea el envío: el modelo de calendario no la necesita.
+            result['collector'] = {'status': 'error', 'error_type': type(exc).__name__}
+            if isinstance(exc, ContractError):
+                result['collector']['detail'] = str(exc)[:200]
+            result['degraded'] = True
         cycle = check_current_cycle(DEFAULT_BASE_URL, api)
         if cycle is not None:
             result['cycle_id'] = cycle['cycle_id']
@@ -63,7 +71,9 @@ def save_report(result, path):
             'status': result.get('status', forecast_result.get('status', 'error')),
             'submitted': forecast_result.get('submitted', False),
             'evaluation_complete': result.get('evaluation', {}).get('complete_cycles'),
-            'evaluation_pending': result.get('evaluation', {}).get('pending_cycles')}
+            'evaluation_pending': result.get('evaluation', {}).get('pending_cycles'),
+            'degraded': result.get('degraded', False),
+            'quarantined': result.get('collector', {}).get('quarantined', 0)}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(safe) + '\n')
     print(json.dumps(safe), flush=True)
