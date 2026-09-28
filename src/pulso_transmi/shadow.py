@@ -40,6 +40,37 @@ def ratio_ultima_hora(base, targets, history, model, cutoff, *, ventana_obs=4,
 
 
 METHODS = {'modelo_base': modelo_base, 'ratio_ultima_hora': ratio_ultima_hora}
+BASE_VERSION = '1.0'  # version_sombra con metodo modelo_base: lo que se envía si algo falla
+
+
+def load_history(store, cutoff, window):
+    """Observaciones (cutoff - window*15min, cutoff]; nunca posteriores al corte."""
+    history = pd.DataFrame(columns=['station_id', 'observed_at', 'demand'])
+    if window:
+        rows = store.observations_window(cutoff - window * STEP, cutoff)
+        if rows:
+            history = pd.DataFrame(rows)
+            history['observed_at'] = pd.to_datetime(history.observed_at, utc=True)
+            history = history[history.observed_at <= cutoff]  # doble barrera contra fuga
+    return history
+
+
+def delivery_values(store, base, targets, model, cutoff):
+    """Valores a ENVIAR según version_envio. Nunca lanza: ante cualquier fallo
+    devuelve el modelo base redondeado (idéntico al envío previo al selector)."""
+    fallback = np.round(np.asarray(base, dtype=float))
+    try:
+        v = store.delivery_version()
+        if v['metodo'] not in METHODS:
+            raise ValueError(f"metodo desconocido {v['metodo']}")
+        history = load_history(store, cutoff, int(v['parametros'].get('ventana_obs', 0)))
+        values, diag = METHODS[v["metodo"]](np.asarray(base, dtype=float).copy(), targets, history, model, cutoff, **v['parametros'])
+        values = np.asarray(values, dtype=float)
+        if values.shape != fallback.shape or not np.isfinite(values).all() or (values < 0).any():
+            raise ValueError('valores inválidos')
+        return values, {'version': v['version'], **diag}
+    except Exception as exc:
+        return fallback, {'version': BASE_VERSION, 'fallback': type(exc).__name__}
 
 
 def run_shadow(store, cycle):
@@ -56,14 +87,7 @@ def run_shadow(store, cycle):
     cutoff = timestamp(cycle['data_cutoff'])
     targets = pd.DataFrame(cycle['targets'])[['station_id', 'target_at']]
     base = np.asarray(model.predict(targets.rename(columns={'target_at': 'observed_at'})), dtype=float)
-    window = max(int(v['parametros'].get('ventana_obs', 0)) for v in pending)
-    history = pd.DataFrame(columns=['station_id', 'observed_at', 'demand'])
-    if window:
-        rows = store.observations_window(cutoff - window * STEP, cutoff)
-        if rows:
-            history = pd.DataFrame(rows)
-            history['observed_at'] = pd.to_datetime(history.observed_at, utc=True)
-            history = history[history.observed_at <= cutoff]  # doble barrera contra fuga
+    history = load_history(store, cutoff, max(int(v['parametros'].get('ventana_obs', 0)) for v in pending))
     computed = []
     for v in pending:
         values, diag = METHODS[v['metodo']](base, targets, history, model, cutoff, **v['parametros'])

@@ -14,6 +14,7 @@ from .client import DEFAULT_BASE_URL
 from .operational import load_env,normalize_cycle
 from .persistence import RemoteStore
 from .prepare_submission import check_current_cycle,timestamp,validate_payload
+from .shadow import delivery_values
 
 
 def prepare(store,cycle):
@@ -28,8 +29,10 @@ def prepare(store,cycle):
     model=store.load_model(record)
     if timestamp(model.end)!=timestamp(meta['training_data_end']):raise ValueError('Metadatos no coinciden con el artefacto')
     targets=pd.DataFrame(cycle['targets']).rename(columns={'target_at':'observed_at'})
-    values=np.round(model.predict(targets))
-    if not np.isfinite(values).all():raise ValueError('Predicciones no finitas')
+    base=np.asarray(model.predict(targets),dtype=float)
+    if not np.isfinite(base).all():raise ValueError('Predicciones no finitas')
+    # Versión elegida en version_envio; ante cualquier fallo, modelo base (sin cambios).
+    values,selection=delivery_values(store,base,pd.DataFrame(cycle['targets'])[['station_id','target_at']],model,cutoff)
     payload={'schema_version':'1.0','cycle_id':cycle['cycle_id'],'client_run_id':str(uuid.uuid4()),
         'data_cutoff':cycle['data_cutoff'],'model':{'version':record['version'],
         'trained_at':meta['trained_at'],'training_data_end':meta['training_data_end']},
@@ -37,7 +40,11 @@ def prepare(store,cycle):
                        for row,value in zip(targets.itertuples(),values)]}
     validate_payload(payload,normalize_cycle(cycle))
     # Ganador de la carrera fija el payload; nunca enviar el payload candidato sin reservar.
-    return store.reserve(payload,record['sha256'])
+    job=store.reserve(payload,record['sha256'])
+    if job.get('client_run_id')==payload['client_run_id']:
+        try:store.record_delivery_version(cycle['cycle_id'],selection)
+        except Exception:pass  # trazabilidad; nunca bloquea el envío
+    return job
 
 
 def forecast(store,api,*,submit=False,token=None,cycle=None):

@@ -113,5 +113,17 @@ class RemoteStore:
         self.request('POST', '/rest/v1/pronostico_sombra', params={'on_conflict': 'ciclo_id,version'},
                      headers={'Prefer': 'resolution=ignore-duplicates'}, json=row)
 
+    def delivery_version(self):
+        selected = self.rows('version_envio', select='version', nombre='eq.demanda')[0]['version']
+        return self.rows('version_sombra', select='version,metodo,parametros,estado', version='eq.' + selected)[0]
+
+    def record_delivery_version(self, cycle_id, selection):
+        self.request('POST', '/rest/v1/envio_por_version', params={'on_conflict': 'ciclo_id'},
+                     headers={'Prefer': 'resolution=ignore-duplicates'},
+                     json={'ciclo_id': cycle_id, 'version': selection['version'], 'diagnostico': selection})
+
+    def review_delivery_version(self):
+        return self.rpc('revisar_version_envio')
+
     def evaluate_deliveries(self):
         return self.rpc('evaluar_entregas')

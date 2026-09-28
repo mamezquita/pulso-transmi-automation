@@ -65,6 +65,11 @@ def execute(store, api, *, submit=False, token=None):
             result['evaluation'] = store.evaluate_deliveries()
         except Exception as exc:
             result.update(status='error', evaluation_error_type=type(exc).__name__)
+    # Reversión automática de la versión enviada si su respaldo rinde mejor (12 ciclos).
+    try:
+        result['version_review'] = store.review_delivery_version()
+    except Exception as exc:
+        result['version_review'] = {'status': 'error', 'error_type': type(exc).__name__}
     try:
         store.finish_attempt(result['attempt_id'], result)
     except Exception as exc:
@@ -82,7 +87,8 @@ def save_report(result, path):
             'evaluation_pending': result.get('evaluation', {}).get('pending_cycles'),
             'degraded': result.get('degraded', False),
             'quarantined': result.get('collector', {}).get('quarantined', 0),
-            'shadow': result.get('shadow', {}).get('status')}
+            'shadow': result.get('shadow', {}).get('status'),
+            'version_review': result.get('version_review', {}).get('status')}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(safe) + '\n')
     print(json.dumps(safe), flush=True)
