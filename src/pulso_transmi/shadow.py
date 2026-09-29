@@ -39,8 +39,65 @@ def ratio_ultima_hora(base, targets, history, model, cutoff, *, ventana_obs=4,
         'ratios': {k: round(v, 4) for k, v in sorted(ratios.items())}, 'sin_datos': sorted(fallback)}
 
 
-METHODS = {'modelo_base': modelo_base, 'ratio_ultima_hora': ratio_ultima_hora}
+def _ratios(history, model, cutoff, k, lo, hi):
+    """Razón real/modelo de las últimas k observaciones por estación (solo ventanas completas)."""
+    past = history[(history.observed_at > cutoff - k * STEP) & (history.observed_at <= cutoff)]
+    out = {}
+    if not past.empty:
+        past = past.assign(model=model.predict(past[['station_id', 'observed_at']]))
+        for sid, g in past.groupby('station_id'):
+            if len(g) == k and g.model.sum() > 0:
+                out[sid] = float(np.clip(g.demand.sum() / g.model.sum(), lo, hi))
+    return out
+
+
+def ratio_conjunto(base, targets, history, model, cutoff, *, ventanas=(2, 4), limite_min=0.33,
+                   limite_max=3.0, ventana_obs=None):
+    """Modelo × promedio de las razones con varias ventanas (menos ruido que una sola)."""
+    per_window = [_ratios(history, model, cutoff, int(k), limite_min, limite_max) for k in ventanas]
+    ratios, fallback = {}, []
+    for sid in targets.station_id.unique():
+        vals = [r[sid] for r in per_window if sid in r]
+        ratios[sid] = float(np.mean(vals)) if vals else 1.0
+        if not vals:
+            fallback.append(sid)
+    factor = targets.station_id.map(ratios).to_numpy(dtype=float)
+    return np.round(np.maximum(base * factor, 0)), {
+        'ratios': {k: round(v, 4) for k, v in sorted(ratios.items())}, 'sin_datos': sorted(fallback)}
+
+
+def ratio_estacional(base, targets, history, model, cutoff, *, ventana_obs=2, peso=0.2,
+                     limite_min=0.33, limite_max=3.0, historial_obs=None):
+    """(1-peso) × modelo corregido + peso × (ayer a la misma hora × hoy/ayer en el corte)."""
+    ratios = _ratios(history, model, cutoff, int(ventana_obs), limite_min, limite_max)
+    level = history.set_index(['station_id', 'observed_at']).demand
+    yday_cut = cutoff - pd.Timedelta(days=1)
+    corrected, seasonal_used, fallback = [], 0, []
+    for sid, t, b in zip(targets.station_id, pd.to_datetime(targets.target_at, utc=True), base):
+        r = ratios.get(sid)
+        if r is None and sid not in fallback:
+            fallback.append(sid)
+        value = b * (r if r is not None else 1.0)
+        now, then, yday = (level.get((sid, cutoff)), level.get((sid, yday_cut)),
+                           level.get((sid, t - pd.Timedelta(days=1))))
+        if None not in (now, then, yday) and then > 0:
+            value = (1 - peso) * value + peso * yday * float(np.clip(now / then, limite_min, limite_max))
+            seasonal_used += 1
+        corrected.append(value)
+    return np.round(np.maximum(np.array(corrected, dtype=float), 0)), {
+        'ratios': {k: round(v, 4) for k, v in sorted(ratios.items())}, 'sin_datos': sorted(fallback),
+        'estacional_usada': seasonal_used}
+
+
+METHODS = {'modelo_base': modelo_base, 'ratio_ultima_hora': ratio_ultima_hora,
+           'ratio_conjunto': ratio_conjunto, 'ratio_estacional': ratio_estacional}
 BASE_VERSION = '1.0'  # version_sombra con metodo modelo_base: lo que se envía si algo falla
+
+
+def lookback(params):
+    """Observaciones de historial que necesita una versión (0 = ninguna)."""
+    return max(int(params.get('ventana_obs') or 0), int(params.get('historial_obs') or 0),
+               max((int(k) for k in params.get('ventanas') or ()), default=0))
 
 
 def load_history(store, cutoff, window):
@@ -63,7 +120,7 @@ def delivery_values(store, base, targets, model, cutoff):
         v = store.delivery_version()
         if v['metodo'] not in METHODS:
             raise ValueError(f"metodo desconocido {v['metodo']}")
-        history = load_history(store, cutoff, int(v['parametros'].get('ventana_obs', 0)))
+        history = load_history(store, cutoff, lookback(v['parametros']))
         values, diag = METHODS[v["metodo"]](np.asarray(base, dtype=float).copy(), targets, history, model, cutoff, **v['parametros'])
         values = np.asarray(values, dtype=float)
         if values.shape != fallback.shape or not np.isfinite(values).all() or (values < 0).any():
@@ -87,7 +144,7 @@ def run_shadow(store, cycle):
     cutoff = timestamp(cycle['data_cutoff'])
     targets = pd.DataFrame(cycle['targets'])[['station_id', 'target_at']]
     base = np.asarray(model.predict(targets.rename(columns={'target_at': 'observed_at'})), dtype=float)
-    history = load_history(store, cutoff, max(int(v['parametros'].get('ventana_obs', 0)) for v in pending))
+    history = load_history(store, cutoff, max(lookback(v['parametros']) for v in pending))
     computed = []
     for v in pending:
         values, diag = METHODS[v['metodo']](base, targets, history, model, cutoff, **v['parametros'])

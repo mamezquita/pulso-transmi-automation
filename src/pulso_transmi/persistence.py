@@ -103,9 +103,17 @@ class RemoteStore:
 
     def observations_window(self, start, end):
         # Dos filtros sobre la misma columna: (start, end]; nunca datos posteriores al corte.
-        rows = self.request('GET', '/rest/v1/observaciones_disponibles', params=[
-            ('select', 'estacion_id,observado_en,demanda'),
-            ('observado_en', 'gt.' + start.isoformat()), ('observado_en', 'lte.' + end.isoformat())]).json()
+        # PostgREST devuelve como máximo 1000 filas: paginar con orden estable.
+        rows, offset = [], 0
+        while True:
+            page = self.request('GET', '/rest/v1/observaciones_disponibles', params=[
+                ('select', 'estacion_id,observado_en,demanda'),
+                ('observado_en', 'gt.' + start.isoformat()), ('observado_en', 'lte.' + end.isoformat()),
+                ('order', 'observado_en.asc,estacion_id.asc'), ('limit', '1000'), ('offset', str(offset))]).json()
+            rows += page
+            offset += len(page)
+            if len(page) < 1000:
+                break
         return [{'station_id': r['estacion_id'], 'observed_at': r['observado_en'], 'demand': r['demanda']}
                 for r in rows]
 
