@@ -130,32 +130,37 @@ def publish(store, model, version_mayor, revision, familia, result, motivo):
 
 
 def safe_now(store, now, open_cycle):
-    """Seguro activar: minutos 10–30 y (entrega de esta hora confirmada o ningún ciclo abierto)."""
+    """(seguro, motivo). Seguro = minutos 10–30, sesiones de envío con el código nuevo y
+    entrega de esta hora confirmada (o ningún ciclo abierto)."""
     if not 10 <= now.minute < 30:
-        return False
-    # La sesión de envíos debe correr el código que entiende modelos con historia:
-    # solo ese código registra las 4 etapas en cada intento.
+        return False, 'fuera de los minutos 10–30'
+    # Solo el código que entiende modelos con historia registra las 4 etapas.
     attempt = store.rows('intento_operativo', select='resultado', order='iniciado_en.desc', limit=1)
     if not attempt or 'etapas' not in (attempt[0].get('resultado') or {}):
-        return False
+        return False, 'la sesión de envíos aún corre el código anterior (llega con el próximo relevo)'
     if open_cycle is None:
-        return True  # el profesor no tiene ventana abierta: nada que pueda quedar a medias
+        return True, 'sin ciclo abierto'
     last = store.rows('ejecucion_operativa', select='ciclo_id,respuesta', respuesta='not.is.null',
                       order='actualizado_en.desc', limit=1)
-    return bool(last) and last[0]['ciclo_id'] == open_cycle.get('cycle_id')
+    if bool(last) and last[0]['ciclo_id'] == open_cycle.get('cycle_id'):
+        return True, 'entrega de esta hora confirmada'
+    return False, 'hay un ciclo abierto sin entrega confirmada'
 
 
-def wait_safe_window(store, max_wait=3600):
+def wait_safe_window(store, max_wait):
     import httpx
-    start = time.time()
+    start, last_reason = time.time(), None
     while time.time() - start < max_wait:
         now = datetime.now(timezone.utc)
         if 10 <= now.minute < 30:
             with httpx.Client(timeout=30) as api:
                 cycle = check_current_cycle(DEFAULT_BASE_URL, api)
-            if safe_now(store, now, cycle):
+            ok, reason = safe_now(store, now, cycle)
+            if ok:
                 return True
-            log('Hay un ciclo abierto sin entrega confirmada; se espera')
+            if reason != last_reason:
+                log(f'Aún no es seguro activar: {reason}')
+                last_reason = reason
         time.sleep(60)
     return False
 
@@ -170,9 +175,23 @@ def activate(store, version_mayor, revision, motivo):
 
 
 # ---------- orquestación ----------
-def run(force=False, trials_lgbm=40, trials_otros=12, budget_family=1800, dry_run=False):
+def run(force=False, trials_lgbm=40, trials_otros=12, budget_family=1800, dry_run=False, activation_wait=4.5 * 3600):
     load_env(Path('.env'))
     store = RemoteStore()
+    started = time.time()
+    pending = store.rows('reentreno', estado='eq.pendiente_activacion', order='reentreno_id.desc', limit=1)
+    if pending and not dry_run:
+        p = pending[0]
+        log(f"Reentreno {p['reentreno_id']} pendiente: activar modelo {p['version_mayor']} r{p['revision']}")
+        if not wait_safe_window(store, max_wait=activation_wait):
+            log('Sigue pendiente; se reintentará en la próxima ejecución')
+            store.close()
+            return {'status': 'pendiente_activacion', 'reentreno_id': p['reentreno_id']}
+        log(f"Activado: {activate(store, p['version_mayor'], p['revision'], p['motivo'])}")
+        store.request('PATCH', '/rest/v1/reentreno', params={'reentreno_id': f"eq.{p['reentreno_id']}"},
+                      json={'estado': 'completado', 'terminado_en': datetime.now(timezone.utc).isoformat()})
+        store.close()
+        return {'status': 'activado', 'reentreno_id': p['reentreno_id']}
     check = store.rpc('necesita_reentreno')
     log(f"Disparo: {check['disparar']} ({check['motivo']})")
     if not (check['disparar'] or force):
@@ -234,10 +253,17 @@ def run(force=False, trials_lgbm=40, trials_otros=12, budget_family=1800, dry_ru
             final.fit(actual, origins)  # todos los datos, incluida la prueba final
             digest, version = publish(store, final, major, rev, familia, chosen, motivo)
             log(f'Registrado {version} ({digest[:12]}); esperando ventana segura para activar')
-            if not wait_safe_window(store):
-                raise RuntimeError('No hubo ventana segura en 60 minutos; modelo registrado pero no activado')
-            log(f"Activado: {activate(store, major, rev, motivo)}")
             version = (major, rev)
+            store.request('PATCH', '/rest/v1/reentreno', params={'reentreno_id': f'eq.{rid}'}, json={
+                'estado': 'pendiente_activacion', 'fase': fase, 'decision': decision, 'motivo': motivo,
+                'accuracy_actual': current['accuracy'], 'accuracy_elegido': chosen['prueba']['accuracy'],
+                'version_mayor': major, 'revision': rev})
+            remaining = max(0, activation_wait - (time.time() - started))
+            if not wait_safe_window(store, max_wait=remaining):
+                log('Sin ventana segura dentro del tiempo del job; queda pendiente para la próxima ejecución')
+                return {'status': 'pendiente_activacion', 'decision': decision, 'motivo': motivo, 'actual': current,
+                        'tabla': [{'familia': r['familia'], **r['prueba'], 'cv': r['cv_accuracy']} for r in table]}
+            log(f"Activado: {activate(store, major, rev, motivo)}")
         if not dry_run:
             store.request('PATCH', '/rest/v1/reentreno', params={'reentreno_id': f'eq.{rid}'}, json={
                 'terminado_en': datetime.now(timezone.utc).isoformat(), 'estado': 'completado', 'fase': fase,
@@ -266,7 +292,7 @@ def main():
     out = run(a.forzar, a.pruebas_lightgbm, a.pruebas_otros, a.presupuesto_familia, a.simular)
     print(json.dumps(out, ensure_ascii=False, default=str))
     summary = os.getenv('GITHUB_STEP_SUMMARY')
-    if summary and out.get('tabla'):
+    if summary and out.get('tabla') and out.get('decision'):
         with open(summary, 'a') as f:
             f.write(f"## Reentreno: {out['decision']}\n\n{out['motivo']}\n\n"
                     f"Entregado hoy: {out['actual']['accuracy']:.1f} %\n\n| Modelo | Accuracy | MAE | MAPE | WAPE |\n|---|---|---|---|---|\n")

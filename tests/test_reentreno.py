@@ -37,14 +37,15 @@ class Store:
 
 def test_activation_only_in_safe_minutes_and_after_this_hour_delivery():
     at = lambda m: datetime(2026, 10, 1, 3, m, tzinfo=timezone.utc)
-    assert not safe_now(Store('c1'), at(5), None)
-    assert safe_now(Store(None), at(15), None)                       # sin ciclo abierto
-    assert safe_now(Store('c1'), at(15), {'cycle_id': 'c1'})         # ya entregado
-    assert not safe_now(Store('c0'), at(15), {'cycle_id': 'c1'})     # abierto y sin entregar
-    assert not safe_now(Store('c1'), at(35), None)
+    assert not safe_now(Store('c1'), at(5), None)[0]
+    assert safe_now(Store(None), at(15), None)[0]                       # sin ciclo abierto
+    assert safe_now(Store('c1'), at(15), {'cycle_id': 'c1'})[0]         # ya entregado
+    assert not safe_now(Store('c0'), at(15), {'cycle_id': 'c1'})[0]     # abierto y sin entregar
+    assert not safe_now(Store('c1'), at(35), None)[0]
 
 
 def test_activation_waits_until_delivery_sessions_run_the_new_code():
     at = datetime(2026, 10, 1, 3, 15, tzinfo=timezone.utc)
-    assert not safe_now(Store(None, new_code=False), at, None)
-    assert safe_now(Store(None, new_code=True), at, None)
+    ok, reason = safe_now(Store(None, new_code=False), at, None)
+    assert not ok and 'código anterior' in reason
+    assert safe_now(Store(None, new_code=True), at, None)[0]
