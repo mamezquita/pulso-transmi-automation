@@ -1,0 +1,45 @@
+name: Reentreno
+# Etapa 4. Corre aparte de las entregas: revisa cada hora si la política pide
+# reentrenar (accuracy de los últimos ciclos bajo el umbral, datos limpios, fuera
+# del periodo de espera). Si sí, búsqueda exhaustiva y activación segura.
+on:
+  workflow_dispatch:
+    inputs:
+      forzar:
+        description: 'Ignorar el disparo (prueba manual)'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '14 * * * *'
+concurrency:
+  group: reentreno
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  reentrenar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: requirements-operativo.txt
+      - name: Instalar runtime probado (mismas versiones que el envío)
+        run: |
+          python -m pip install -r requirements-operativo.txt
+          python -m pip install --no-deps .
+      - name: Verificar disparo y reentrenar
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          FORZAR: ${{ inputs.forzar || false }}
+        run: |
+          cd "$RUNNER_TEMP"
+          args=()
+          if [ "$FORZAR" = "true" ]; then args+=(--forzar); fi
+          python -m pulso_transmi.reentreno "${args[@]}"

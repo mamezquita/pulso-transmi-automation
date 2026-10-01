@@ -14,7 +14,7 @@ from .client import DEFAULT_BASE_URL
 from .operational import load_env,normalize_cycle
 from .persistence import RemoteStore
 from .prepare_submission import check_current_cycle,timestamp,validate_payload
-from .shadow import delivery_values
+from .shadow import base_predictions,delivery_values
 
 
 def prepare(store,cycle):
@@ -29,10 +29,11 @@ def prepare(store,cycle):
     model=store.load_model(record)
     if timestamp(model.end)!=timestamp(meta['training_data_end']):raise ValueError('Metadatos no coinciden con el artefacto')
     targets=pd.DataFrame(cycle['targets']).rename(columns={'target_at':'observed_at'})
-    base=np.asarray(model.predict(targets),dtype=float)
+    raw_targets=pd.DataFrame(cycle['targets'])[['station_id','target_at']]
+    base=base_predictions(store,model,raw_targets,cutoff)
     if not np.isfinite(base).all():raise ValueError('Predicciones no finitas')
     # Versión elegida en version_envio; ante cualquier fallo, modelo base (sin cambios).
-    values,selection=delivery_values(store,base,pd.DataFrame(cycle['targets'])[['station_id','target_at']],model,cutoff)
+    values,selection=delivery_values(store,base,raw_targets,model,cutoff)
     payload={'schema_version':'1.0','cycle_id':cycle['cycle_id'],'client_run_id':str(uuid.uuid4()),
         'data_cutoff':cycle['data_cutoff'],'model':{'version':record['version'],
         'trained_at':meta['trained_at'],'training_data_end':meta['training_data_end']},

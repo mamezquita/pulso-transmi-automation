@@ -112,6 +112,16 @@ def load_history(store, cutoff, window):
     return history
 
 
+def base_predictions(store, model, targets, cutoff):
+    """Predicción del modelo activo. Los modelos con historia (lookback_obs > 0) reciben
+    las observaciones hasta el corte; los de calendario predicen como siempre."""
+    lookback = int(getattr(model, 'lookback_obs', 0) or 0)
+    if lookback:
+        history = load_history(store, cutoff, lookback)
+        return np.asarray(model.predict_at(targets[['station_id', 'target_at']], history, cutoff), dtype=float)
+    return np.asarray(model.predict(targets.rename(columns={'target_at': 'observed_at'})), dtype=float)
+
+
 def delivery_values(store, base, targets, model, cutoff):
     """Valores a ENVIAR según version_envio. Nunca lanza: ante cualquier fallo
     devuelve el modelo base redondeado (idéntico al envío previo al selector)."""
@@ -143,7 +153,7 @@ def run_shadow(store, cycle):
     model = store.load_model(record)
     cutoff = timestamp(cycle['data_cutoff'])
     targets = pd.DataFrame(cycle['targets'])[['station_id', 'target_at']]
-    base = np.asarray(model.predict(targets.rename(columns={'target_at': 'observed_at'})), dtype=float)
+    base = base_predictions(store, model, targets, cutoff)
     history = load_history(store, cutoff, max(lookback(v['parametros']) for v in pending))
     computed = []
     for v in pending:

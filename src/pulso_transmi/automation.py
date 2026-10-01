@@ -3,6 +3,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -16,6 +17,25 @@ from .persistence import RemoteStore
 from .contract import ContractError
 from .prepare_submission import check_current_cycle
 from .shadow import run_shadow
+
+
+class _Etapa:
+    """Registra inicio, fin, duración y estado de una etapa en result['etapas']."""
+    def __init__(self, result, name):
+        self.result, self.name = result, name
+    def __enter__(self):
+        self.t0 = time.monotonic(); self.inicio = datetime.now(timezone.utc)
+        self.row = {'etapa': self.name, 'inicio': self.inicio.isoformat(), 'estado': 'ok', 'resultado': {}}
+        self.result.setdefault('etapas', []).append(self.row)
+        return self.row
+    def __exit__(self, exc_type, exc, tb):
+        self.row['fin'] = datetime.now(timezone.utc).isoformat()
+        self.row['ms'] = int((time.monotonic() - self.t0) * 1000)
+        if exc_type is not None:
+            self.row['estado'] = 'error'; self.row['resultado'] = {'error_type': exc_type.__name__}
+        return False
+
+EXPECTED_PARTICIPANT = 'stu_fbbcf1d8318b4f75990c2b582255bdba'
 
 EXPECTED_PARTICIPANT = os.getenv('EXPECTED_PARTICIPANT_ID', '')
 
@@ -36,20 +56,25 @@ def execute(store, api, *, submit=False, token=None):
                 raise ValueError('La API key no pertenece al participante esperado')
             result['participant'] = identity['display_name']
         try:
-            result['collector'] = collect(store, api)
+            with _Etapa(result, 'colector') as et:
+                result['collector'] = collect(store, api)
+                et['resultado'] = {'insertados': result['collector'].get('inserted'),
+                                   'cuarentena': result['collector'].get('quarantined', 0)}
         except Exception as exc:
             # La ingesta nunca bloquea el envío: el modelo de calendario no la necesita.
             result['collector'] = {'status': 'error', 'error_type': type(exc).__name__}
             if isinstance(exc, ContractError):
                 result['collector']['detail'] = str(exc)[:200]
             result['degraded'] = True
-        cycle = check_current_cycle(DEFAULT_BASE_URL, api)
-        if cycle is not None:
-            result['cycle_id'] = cycle['cycle_id']
-            store.observe_cycle(cycle)
-            result['forecast'] = forecast(store, api, submit=submit, token=token, cycle=cycle)
-        else:
-            result['forecast'] = {'status': 'no_open_cycle', 'submitted': False}
+        with _Etapa(result, 'envio') as et:
+            cycle = check_current_cycle(DEFAULT_BASE_URL, api)
+            if cycle is not None:
+                result['cycle_id'] = cycle['cycle_id']
+                store.observe_cycle(cycle)
+                result['forecast'] = forecast(store, api, submit=submit, token=token, cycle=cycle)
+            else:
+                result['forecast'] = {'status': 'no_open_cycle', 'submitted': False}
+            et['resultado'] = {'estado': result['forecast'].get('status'), 'enviado': result['forecast'].get('submitted', False)}
     except Exception as exc:
         result.update(status='error', error_type=type(exc).__name__)
     # Sombra después del envío: calcula versiones alternativas sin reservar ni enviar.
@@ -62,7 +87,10 @@ def execute(store, api, *, submit=False, token=None):
     # También evaluar si falló el pronóstico, siempre que la ingesta terminó.
     if 'collector' in result:
         try:
-            result['evaluation'] = store.evaluate_deliveries()
+            with _Etapa(result, 'drift') as et:
+                result['evaluation'] = store.evaluate_deliveries()
+                drift = result['evaluation'].get('drift') or {}
+                et['resultado'] = {'estado': drift.get('status'), 'decision': drift.get('decision')}
         except Exception as exc:
             result.update(status='error', evaluation_error_type=type(exc).__name__)
     # Reversión automática de la versión enviada si su respaldo rinde mejor (12 ciclos).
