@@ -17,10 +17,14 @@ from .prepare_submission import check_current_cycle,timestamp,validate_payload
 from .shadow import base_predictions,delivery_values
 
 
-def prepare(store,cycle):
-    job=store.job(cycle['cycle_id'])
-    if job:return job
-    record=store.active_model();meta=record['metadata']
+# Si el modelo activo falla (carga, validación o predicción), el ciclo sale con el modelo
+# de calendario inicial + la corrección que se usó con él en vivo, en vez de no enviarse.
+FALLBACK_MODEL=(1,0)
+FALLBACK_CORRECTION='2.3'
+
+
+def predict_base(store,record,cycle,raw_targets):
+    meta=record['metadata']
     cutoff=timestamp(cycle['data_cutoff'])
     if timestamp(meta['training_data_end'])>cutoff:raise ValueError('Modelo entrenado después del corte')
     latest=store.latest_observation(cycle['data_cutoff'])
@@ -28,12 +32,35 @@ def prepare(store,cycle):
         raise ValueError('El histórico persistido no cubre el entrenamiento del modelo activo')
     model=store.load_model(record)
     if timestamp(model.end)!=timestamp(meta['training_data_end']):raise ValueError('Metadatos no coinciden con el artefacto')
+    base=base_predictions(store,model,raw_targets,cutoff)
+    if base.shape!=(len(raw_targets),) or not np.isfinite(base).all():raise ValueError('Predicciones no finitas')
+    return model,base
+
+
+def prepare(store,cycle):
+    job=store.job(cycle['cycle_id'])
+    if job:return job
+    record=store.active_model()
+    cutoff=timestamp(cycle['data_cutoff'])
     targets=pd.DataFrame(cycle['targets']).rename(columns={'target_at':'observed_at'})
     raw_targets=pd.DataFrame(cycle['targets'])[['station_id','target_at']]
-    base=base_predictions(store,model,raw_targets,cutoff)
-    if not np.isfinite(base).all():raise ValueError('Predicciones no finitas')
-    # Versión elegida en version_envio; ante cualquier fallo, modelo base (sin cambios).
-    values,selection=delivery_values(store,base,raw_targets,model,cutoff)
+    fallback=False
+    try:
+        model,base=predict_base(store,record,cycle,raw_targets)
+        # Versión elegida en version_envio; ante cualquier fallo, modelo base (sin cambios).
+        values,selection=delivery_values(store,base,raw_targets,model,cutoff)
+    except Exception as exc:
+        failed=record
+        try:
+            record=store.fallback_model(*FALLBACK_MODEL)
+            if record['sha256']==failed['sha256']:raise exc  # el respaldo es el mismo modelo que falló
+            model,base=predict_base(store,record,cycle,raw_targets)
+        except Exception as fallback_exc:
+            raise exc from fallback_exc  # se reporta la falla del modelo activo
+        values,selection=delivery_values(store,base,raw_targets,model,cutoff,version=FALLBACK_CORRECTION)
+        selection={**selection,'respaldo':{'modelo_fallido':failed['version'],'error':type(exc).__name__,'detalle':str(exc)[:300]}}
+        fallback=True
+    meta=record['metadata']
     payload={'schema_version':'1.0','cycle_id':cycle['cycle_id'],'client_run_id':str(uuid.uuid4()),
         'data_cutoff':cycle['data_cutoff'],'model':{'version':record['version'],
         'trained_at':meta['trained_at'],'training_data_end':meta['training_data_end']},
@@ -41,7 +68,7 @@ def prepare(store,cycle):
                        for row,value in zip(targets.itertuples(),values)]}
     validate_payload(payload,normalize_cycle(cycle))
     # Ganador de la carrera fija el payload; nunca enviar el payload candidato sin reservar.
-    job=store.reserve(payload,record['sha256'])
+    job=store.reserve(payload,record['sha256'],fallback=True) if fallback else store.reserve(payload,record['sha256'])
     if job.get('client_run_id')==payload['client_run_id']:
         try:store.record_delivery_version(cycle['cycle_id'],selection)
         except Exception:pass  # trazabilidad; nunca bloquea el envío

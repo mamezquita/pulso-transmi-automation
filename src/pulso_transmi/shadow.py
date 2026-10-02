@@ -122,12 +122,12 @@ def base_predictions(store, model, targets, cutoff):
     return np.asarray(model.predict(targets.rename(columns={'target_at': 'observed_at'})), dtype=float)
 
 
-def delivery_values(store, base, targets, model, cutoff):
-    """Valores a ENVIAR según version_envio. Nunca lanza: ante cualquier fallo
-    devuelve el modelo base redondeado (idéntico al envío previo al selector)."""
+def delivery_values(store, base, targets, model, cutoff, version=None):
+    """Valores a ENVIAR según version_envio (o la versión indicada). Nunca lanza: ante
+    cualquier fallo devuelve el modelo base redondeado (idéntico al envío previo al selector)."""
     fallback = np.round(np.asarray(base, dtype=float))
     try:
-        v = store.delivery_version()
+        v = store.shadow_version(version) if version else store.delivery_version()
         if v['metodo'] not in METHODS:
             raise ValueError(f"metodo desconocido {v['metodo']}")
         history = load_history(store, cutoff, lookback(v['parametros']))

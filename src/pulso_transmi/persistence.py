@@ -60,8 +60,14 @@ class RemoteStore:
         result=self.rows('ejecucion_operativa',ciclo_id='eq.'+cycle_id)
         return result[0] if result else None
 
-    def reserve(self,payload,sha):
-        return self.rpc('reservar_submission',p_payload=payload,p_model_sha=sha)
+    def reserve(self,payload,sha,fallback=False):
+        if not fallback:return self.rpc('reservar_submission',p_payload=payload,p_model_sha=sha)
+        return self.rpc('reservar_submission',p_payload=payload,p_model_sha=sha,p_respaldo=True)
+
+    def fallback_model(self,major,revision):
+        version=self.rows('version_modelo',select='modelo_sha256',version_mayor=f'eq.{major}',revision=f'eq.{revision}')
+        if not version:raise ValueError(f'No existe el modelo de respaldo {major} r{revision}')
+        return self.rows('registro_modelo_operativo',sha256='eq.'+version[0]['modelo_sha256'])[0]
 
     def finish(self,job,response=None,error=None):
         return self.rpc('registrar_respuesta',p_cycle=job['ciclo_id'],p_run=job['client_run_id'],p_response=response,p_error=error)
@@ -123,7 +129,10 @@ class RemoteStore:
 
     def delivery_version(self):
         selected = self.rows('version_envio', select='version', nombre='eq.demanda')[0]['version']
-        return self.rows('version_sombra', select='version,metodo,parametros,estado', version='eq.' + selected)[0]
+        return self.shadow_version(selected)
+
+    def shadow_version(self, version):
+        return self.rows('version_sombra', select='version,metodo,parametros,estado', version='eq.' + version)[0]
 
     def record_delivery_version(self, cycle_id, selection):
         self.request('POST', '/rest/v1/envio_por_version', params={'on_conflict': 'ciclo_id'},
