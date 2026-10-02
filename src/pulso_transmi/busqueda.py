@@ -76,7 +76,11 @@ FAMILIES = {
         'hidden_layer_sizes': [(32,), (64,), (64, 32), (128, 64)], 'alpha': [1e-4, 1e-3, 1e-2],
         'learning_rate_init': [1e-3, 3e-3]}),
 }
-COMMON = {'feature_set': list(FEATURE_SETS), 'objetivo': ['relativo', 'directo']}
+# Claves de ModeloHistoria (no del estimador). `vida_media_dias` da más peso a lo reciente
+# (2-oct: con 1 día la combinación pasó de 69,1 % a 71,6 % en la prueba final).
+COMMON = {'feature_set': list(FEATURE_SETS), 'objetivo': ['relativo', 'directo'],
+          'vida_media_dias': [None, 1, 2, 4]}
+MODEL_KEYS = set(COMMON)
 
 
 def split(origins, folds=3):
@@ -114,7 +118,7 @@ def build_model(family, cfg):
     if family == COMBINATION:
         return ModeloCombinado([build_model(m['familia'], m['config']) for m in cfg['miembros']], cfg)
     build, _ = FAMILIES[family]
-    params = {k: v for k, v in cfg.items() if k not in COMMON}
+    params = {k: v for k, v in cfg.items() if k not in MODEL_KEYS}
     return ModeloHistoria(build(params, FEATURE_SETS[cfg['feature_set']]), family, cfg['feature_set'],
                           cfg['objetivo'], cfg)
 

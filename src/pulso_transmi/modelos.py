@@ -11,6 +11,8 @@ normalización). Solo usa scikit-learn y LightGBM, ya presentes en el entorno de
 """
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 import pandas as pd
 
@@ -34,6 +36,27 @@ NEEDS_HISTORY = 4 * 3 + DAY_STEPS + 4  # 3 h de historia + un día + margen
 
 def _local(times):
     return pd.DatetimeIndex(times).tz_convert(TZ)
+
+
+def recency_weights(origins, half_life_days):
+    """Peso 1 para el origen más reciente; se reduce a la mitad cada `half_life_days`."""
+    if not half_life_days:
+        return None
+    origins = pd.to_datetime(pd.Series(origins), utc=True)
+    age = (origins.max() - origins).dt.total_seconds().to_numpy() / 86400
+    return np.power(0.5, age / float(half_life_days))
+
+
+def fit_weighted(estimator, X, y, weights):
+    """Entrena con pesos si el estimador los admite (en un Pipeline, el último paso)."""
+    if weights is None:
+        return estimator.fit(X, y)
+    final = estimator.steps[-1] if hasattr(estimator, 'steps') else None
+    target = final[1] if final else estimator
+    if 'sample_weight' not in inspect.signature(target.fit).parameters:
+        return estimator.fit(X, y)  # p. ej. KNN: sin pesos
+    key = f'{final[0]}__sample_weight' if final else 'sample_weight'
+    return estimator.fit(X, y, **{key: weights})
 
 
 class ModeloHistoria:
@@ -119,7 +142,8 @@ class ModeloHistoria:
 
     def fit_prepared(self, X, y):
         target = y / self._reference(X).to_numpy() if self.objetivo == 'relativo' else y
-        self.estimador.fit(X[FEATURE_SETS[self.feature_set]], target)
+        weights = recency_weights(X['origin'], self.config.get('vida_media_dias'))
+        fit_weighted(self.estimador, X[FEATURE_SETS[self.feature_set]], target, weights)
         self.n_train = int(len(X))
         return self
 

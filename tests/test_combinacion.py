@@ -66,3 +66,23 @@ def test_active_model_that_saw_the_test_day_is_retrained_without_it(monkeypatch)
     assert calls == [('lightgbm', {'feature_set': 'reciente'})]
     calendar = SimpleNamespace(end='2026-09-11T11:00:00-05:00')  # modelo de calendario, sin fuga
     assert reentreno.fair_current_score(None, calendar, None, 'corte', test_origins)['accuracy'] == 85.0
+
+
+def test_recency_weights_halve_every_half_life():
+    from pulso_transmi.modelos import recency_weights
+    origins = pd.to_datetime(['2026-09-17T00:00Z', '2026-09-18T00:00Z', '2026-09-19T00:00Z'])
+    assert np.allclose(recency_weights(origins, 1), [0.25, 0.5, 1.0])
+    assert recency_weights(origins, None) is None
+
+
+def test_weights_reach_the_final_step_and_are_skipped_when_unsupported():
+    from sklearn.neighbors import KNeighborsRegressor
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    from pulso_transmi.modelos import fit_weighted
+    X = np.array([[0.0], [1.0], [2.0], [3.0]]); y = np.array([0.0, 0.0, 10.0, 10.0])
+    w = np.array([1.0, 1.0, 1e-6, 1e-6])
+    weighted = fit_weighted(make_pipeline(StandardScaler(), Ridge(alpha=1e-6)), X, y, w)
+    plain = make_pipeline(StandardScaler(), Ridge(alpha=1e-6)).fit(X, y)
+    assert abs(weighted.predict([[1.0]])[0]) < abs(plain.predict([[1.0]])[0])  # los pesos sí cuentan
+    fit_weighted(KNeighborsRegressor(n_neighbors=2), X, y, w)  # sin sample_weight: entrena sin pesos
