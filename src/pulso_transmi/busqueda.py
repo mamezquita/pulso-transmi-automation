@@ -10,6 +10,7 @@ participa en el ajuste.
 """
 from __future__ import annotations
 
+import itertools
 import time
 
 import numpy as np
@@ -25,7 +26,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 
 from .model import evaluar
-from .modelos import FEATURE_SETS, ModeloHistoria
+from .modelos import FEATURE_SETS, ModeloCombinado, ModeloHistoria
 
 FOLD_ORIGINS = 24  # un día de ciclos horarios por pliegue
 CATEGORICAL = ['st']
@@ -105,15 +106,28 @@ class Corte:
         self.re = np.array([actual.at[t, s] for t, s in zip(self.Xe.target_at, self.Xe.station_id)], dtype=float)
 
 
-def _evaluate(corte, family, cfg):
+COMBINATION = 'combinacion'
+
+
+def build_model(family, cfg):
+    """Modelo sin entrenar para una familia y configuración (también la combinación)."""
+    if family == COMBINATION:
+        return ModeloCombinado([build_model(m['familia'], m['config']) for m in cfg['miembros']], cfg)
     build, _ = FAMILIES[family]
     params = {k: v for k, v in cfg.items() if k not in COMMON}
-    model = ModeloHistoria(build(params, FEATURE_SETS[cfg['feature_set']]), family, cfg['feature_set'],
-                           cfg['objetivo'], cfg).adopt(corte.shell)
-    model.fit_prepared(corte.X, corte.y)
-    pred = model._predict_frame(corte.Xe)
+    return ModeloHistoria(build(params, FEATURE_SETS[cfg['feature_set']]), family, cfg['feature_set'],
+                          cfg['objetivo'], cfg)
+
+
+def _score(corte, pred):
     ok = ~np.isnan(corte.re)
-    return model, score(corte.re[ok], np.round(pred[ok]), corte.Xe.station_id.to_numpy()[ok])
+    return score(corte.re[ok], np.round(pred[ok]), corte.Xe.station_id.to_numpy()[ok])
+
+
+def _evaluate(corte, family, cfg):
+    model = build_model(family, cfg).adopt(corte.shell)
+    model.fit_prepared(corte.X, corte.y)
+    return model, _score(corte, model._predict_frame(corte.Xe))
 
 
 def cortes(actual, origins):
@@ -146,6 +160,37 @@ def search_family(cuts, family, trials=20, seed=42, time_budget=None, log=print)
     model, test_score = _evaluate(test, family, best_cfg)
     return {'familia': family, 'config': best_cfg, 'cv_accuracy': best_cv, 'pliegues': best_folds,
             'prueba': test_score, 'pruebas_realizadas': len(results), 'segundos': round(time.time() - start, 1)}, model
+
+
+def evaluate_config(corte, family, cfg):
+    """Puntaje de una configuración entrenada solo con lo anterior al corte (también combinaciones)."""
+    if family == COMBINATION:
+        preds = [_evaluate(corte, m['familia'], m['config'])[0]._predict_frame(corte.Xe) for m in cfg['miembros']]
+        return _score(corte, np.mean(preds, axis=0))
+    return _evaluate(corte, family, cfg)[1]
+
+
+def search_combination(cuts, results, top=3, log=print):
+    """Promedio de las mejores familias (por validación cruzada): se prueban todos los
+    subconjuntos de 2 o más entre las `top` primeras y gana el de mejor promedio de pliegues."""
+    folds, test = cuts
+    start = time.time()
+    best = sorted(results, key=lambda r: r['cv_accuracy'], reverse=True)[:top]
+    if len(best) < 2:
+        return None
+    members = {r['familia']: r['config'] for r in best}
+    fold_preds = [{f: _evaluate(c, f, cfg)[0]._predict_frame(c.Xe) for f, cfg in members.items()} for c in folds]
+    tried = []
+    for size in range(2, len(members) + 1):
+        for combo in itertools.combinations(members, size):
+            scores = [_score(c, np.mean([p[f] for f in combo], axis=0))['accuracy'] for c, p in zip(folds, fold_preds)]
+            tried.append((float(np.mean(scores)), combo, scores))
+            log(f"  combinación {'+'.join(combo)}: pliegues {np.round(scores, 1)} -> {np.mean(scores):.2f}")
+    cv, combo, fold_scores = max(tried, key=lambda t: t[0])
+    config = {'miembros': [{'familia': f, 'config': members[f]} for f in combo]}
+    return {'familia': COMBINATION, 'config': config, 'cv_accuracy': cv, 'pliegues': fold_scores,
+            'prueba': evaluate_config(test, COMBINATION, config), 'pruebas_realizadas': len(tried),
+            'segundos': round(time.time() - start, 1)}
 
 
 def current_pipeline_score(actual, model_pivot, test, ratio_window=4, lo=0.5, hi=2.0):

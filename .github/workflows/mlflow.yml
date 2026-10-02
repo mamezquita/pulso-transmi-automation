@@ -1,0 +1,38 @@
+name: MLflow
+# Copia a MLflow (esquema mlflow de Supabase) las versiones, modelos, reentrenos y
+# evaluaciones de drift. Idempotente; corre aparte de las entregas y no las toca.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '25 * * * *'
+concurrency:
+  group: mlflow
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  sincronizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: requirements-mlflow.txt
+      - name: Instalar MLflow
+        run: python -m pip install -r requirements-mlflow.txt
+      - name: Sincronizar Supabase con MLflow
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          MLFLOW_DB_PASSWORD: ${{ secrets.MLFLOW_DB_PASSWORD }}
+          MLFLOW_DISABLE_AGENT_HINT: '1'
+        run: |
+          script="$GITHUB_WORKSPACE/tools/mlflow_sync.py"
+          cd "$RUNNER_TEMP"
+          python "$script" | tee resultado.json
+          { echo '### MLflow'; echo '```json'; cat resultado.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

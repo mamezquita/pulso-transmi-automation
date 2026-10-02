@@ -29,7 +29,6 @@ import pandas as pd
 
 from . import backtest as bt
 from . import busqueda as bq
-from .modelos import ModeloHistoria
 from .client import DEFAULT_BASE_URL
 from .prepare_submission import check_current_cycle
 from .operational import load_env
@@ -75,6 +74,16 @@ def current_score(actual, model, selector, test_origins):
             if not np.isnan(r):
                 reals.append(r); preds.append(v); sts.append(s)
     return bq.score(np.array(reals, float), np.round(np.array(preds, float)), np.array(sts))
+
+
+def fair_current_score(actual, model, selector, test_cut, test_origins):
+    """Lo entregado, medido igual que los candidatos. Si el modelo activo ya vio la prueba
+    final al entrenarse, su puntaje estaría inflado: se reentrena su misma configuración
+    solo con los datos anteriores a la prueba (los modelos con historia usan corrección 1.0)."""
+    familia = getattr(model, 'familia', None)
+    if familia and getattr(model, 'config', None) and pd.Timestamp(model.end) >= test_origins[0]:
+        return {**bq.evaluate_config(test_cut, familia, model.config), 'reentrenado_sin_prueba': True}
+    return current_score(actual, model, selector, test_origins)
 
 
 # ---------- búsqueda según la política ----------
@@ -213,7 +222,7 @@ def run(force=False, trials_lgbm=40, trials_otros=12, budget_family=1800, dry_ru
         cuts = bq.cortes(actual, origins)
         test = cuts[1].Xe.origin.drop_duplicates().tolist()
         active_model = store.load_model(store.active_model())
-        current = current_score(actual, active_model, store.delivery_version(), test)
+        current = fair_current_score(actual, active_model, store.delivery_version(), cuts[1], test)
         log(f"Entregado hoy en la prueba final: {current['accuracy']:.2f} %")
 
         lgbm, _ = bq.search_family(cuts, LGBM, trials=trials_lgbm, time_budget=budget_family, log=log)
@@ -224,6 +233,11 @@ def run(force=False, trials_lgbm=40, trials_otros=12, budget_family=1800, dry_ru
                 res, _ = bq.search_family(cuts, fam, trials=trials_otros, time_budget=budget_family, log=log)
                 log(f"{fam}: prueba {res['prueba']['accuracy']:.2f} %")
                 others.append(res)
+            combo = bq.search_combination(cuts, [lgbm] + others, log=log)
+            if combo:
+                log(f"combinacion ({'+'.join(m['familia'] for m in combo['config']['miembros'])}): "
+                    f"prueba {combo['prueba']['accuracy']:.2f} %")
+                others.append(combo)
         decision, familia, chosen, fase, motivo = decide(policy, current, lgbm, others)
         log(f'Decisión: {decision} — {motivo}')
         table = [lgbm] + others
@@ -246,10 +260,7 @@ def run(force=False, trials_lgbm=40, trials_otros=12, budget_family=1800, dry_ru
                 major = families[familia]
             revs = store.rows('version_modelo', select='revision', version_mayor=f'eq.{major}', order='revision.desc', limit=1)
             rev = revs[0]['revision'] + 1 if revs else 0
-            build, _ = bq.FAMILIES[familia]
-            cfg = chosen['config']
-            params = {k: v for k, v in cfg.items() if k not in bq.COMMON}
-            final = ModeloHistoria(build(params, bq.FEATURE_SETS[cfg['feature_set']]), familia, cfg['feature_set'], cfg['objetivo'], cfg)
+            final = bq.build_model(familia, chosen['config'])
             final.fit(actual, origins)  # todos los datos, incluida la prueba final
             digest, version = publish(store, final, major, rev, familia, chosen, motivo)
             log(f'Registrado {version} ({digest[:12]}); esperando ventana segura para activar')

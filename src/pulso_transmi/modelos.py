@@ -162,3 +162,36 @@ class ModeloHistoria:
         """Compatibilidad con la corrección de sombra: perfil de calendario sin historia."""
         df = pd.DataFrame(df)
         return self._profile_at(df.station_id.astype(str), pd.to_datetime(df.observed_at, utc=True))
+
+
+class ModeloCombinado:
+    """Promedio de varios ModeloHistoria (familias distintas con errores distintos).
+    Misma interfaz que usa el envío: `end`, `lookback_obs`, `predict_at()` y `predict()`."""
+    familia = 'combinacion'
+
+    def __init__(self, miembros, config=None):
+        self.miembros = list(miembros)
+        self.config = config or {}
+
+    @property
+    def lookback_obs(self):
+        return max(m.lookback_obs for m in self.miembros)
+
+    @property
+    def end(self):
+        return self.miembros[0].end
+
+    @property
+    def n_train(self):
+        return self.miembros[0].n_train
+
+    def fit(self, actual, origins):
+        for m in self.miembros:
+            m.fit(actual, origins)
+        return self
+
+    def predict_at(self, targets, history, cutoff):
+        return np.mean([m.predict_at(targets, history, cutoff) for m in self.miembros], axis=0)
+
+    def predict(self, df):
+        return np.mean([np.asarray(m.predict(df), dtype=float) for m in self.miembros], axis=0)
