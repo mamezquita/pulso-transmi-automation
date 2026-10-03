@@ -8,7 +8,8 @@ import pandas as pd
 import pytest
 
 import mutaciones as M
-from pulso_transmi.contract import ContractError, normalize_cycle_contract, normalize_observations, normalize_receipt
+from pulso_transmi.contract import (ContractError, normalize_cycle_contract, normalize_observations, normalize_receipt,
+                                    page_parts)
 
 FIX = Path(__file__).parent / 'fixtures'
 CYCLE = json.loads((FIX / 'ciclo_vivo.json').read_text())
@@ -22,7 +23,7 @@ def cycle_key(c):
 
 
 def page_rows(page):
-    return next(page[k] for k in ('data', 'items', 'results') if k in page)
+    return page_parts(page)[0]
 
 
 def trimmed(rows):  # algunas mutaciones pierden los segundos de released_at
@@ -91,3 +92,16 @@ def test_unreadable_closing_time_is_left_empty_not_invented():
     out = normalize_cycle_contract(c)
     assert out['closes_at'] is None and out['formato_no_leido'] == ['closes_at']
     assert out['targets'] == normalize_cycle_contract(CYCLE)['targets']
+
+
+def test_unknown_columns_that_are_ambiguous_go_to_quarantine_instead_of_guessing():
+    # Dos columnas enteras con la misma cantidad de valores distintos: no se sabe cuál es la estación.
+    rows = [{'a': 2300 + i, 'b': 100 + i, 'ts': '2026-09-09T05:00:00Z', 'pub': '2026-09-21T15:30:00Z'} for i in range(4)]
+    good, bad, _ = normalize_observations(rows)
+    assert good == [] and len(bad) == 4
+
+
+def test_known_field_names_never_trigger_content_inference(monkeypatch):
+    import pulso_transmi.contract as contract
+    monkeypatch.setattr(contract, '_infer_columns', lambda rows: (_ for _ in ()).throw(AssertionError('no debía inferir')))
+    assert len(normalize_observations(PAGE['data'])[0]) == len(PAGE['data'])

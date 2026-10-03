@@ -8,6 +8,7 @@ resultado normalizado debe ser idéntico al del original.
 """
 import copy
 from datetime import datetime, timezone
+from email.utils import format_datetime
 
 import pandas as pd
 
@@ -34,6 +35,11 @@ DATES = {
     'fecha_compacta': lambda t: t.strftime('%Y%m%dT%H%M%SZ'),
     'fecha_mes_es': lambda t: f'{t.day:02d} {MONTHS_ES[t.month - 1]} {t.year} {t:%H:%M}',
     'fecha_mes_en': lambda t: f'{MONTHS_EN[t.month - 1]} {t.day:02d}, {t.year} {t:%H:%M}',
+    'fecha_rfc2822': lambda t: format_datetime(t.to_pydatetime(), usegmt=True),
+    'fecha_utc_texto': lambda t: t.strftime('%Y-%m-%d %H:%M:%S UTC'),
+    'fecha_am_pm': lambda t: t.strftime('%Y-%m-%d %I:%M %p'),
+    'fecha_minusculas': lambda t: t.strftime('%Y-%m-%dt%H:%M:%Sz'),
+    'fecha_offset_compacto': lambda t: t.tz_convert('America/Bogota').strftime('%Y-%m-%dT%H:%M:%S%z'),
 }
 
 # ---- números enteros ----
@@ -43,6 +49,15 @@ NUMBERS = {
     'numero_texto_decimal': lambda n: f'{n}.0',
     'numero_coma_decimal': lambda n: f'{n},0',
     'numero_espacios': lambda n: f' {n} ',
+    'numero_miles_coma': lambda n: f'{n:,}',
+    'numero_miles_punto': lambda n: f'{n:,}'.replace(',', '.'),
+    'numero_cientifico': lambda n: f'{n:e}',
+}
+# Horizontes como duración.
+DURATIONS = {
+    'horizonte_min': lambda n: f'{n} min',
+    'horizonte_m': lambda n: f'{n}m',
+    'horizonte_iso': lambda n: f'PT{n}M',
 }
 
 # ---- estaciones ----
@@ -50,6 +65,8 @@ STATIONS = {
     'estacion_entero': lambda s: int(s),
     'estacion_sin_ceros': lambda s: str(int(s)),
     'estacion_espacios': lambda s: f' {s} ',
+    'estacion_float_texto': lambda s: f'{int(s)}.0',
+    'estacion_prefijo': lambda s: f'ST-{s}',
 }
 
 # ---- booleanos (verdadero) ----
@@ -102,6 +119,14 @@ def cycle_mutations(raw):
         out[name] = c
     for name, fn in KEYS.items():
         out[name] = _rename(copy.deepcopy(raw), fn)
+    for name, fn in DURATIONS.items():
+        c = copy.deepcopy(raw)
+        c['horizons_minutes'] = [fn(h) for h in c.get('horizons_minutes', [])]
+        for t in c['targets']:
+            t['horizon_minutes'] = fn(t['horizon_minutes'])
+        out[name] = c
+    c = copy.deepcopy(raw); c['items'] = c.pop('targets'); out['targets_como_items'] = c
+    c = copy.deepcopy(raw); out['ciclo_envuelto'] = {'data': c}
     c = copy.deepcopy(raw); c['state'] = 'OPEN'; out['estado_mayusculas'] = c
     c = copy.deepcopy(raw); c['state'] = True; out['estado_booleano'] = c
     c = copy.deepcopy(raw); c['state'] = 'yes'; out['estado_yes'] = c
@@ -135,6 +160,11 @@ def stream_mutations(page):
         out[name] = p
     for name, fn in KEYS.items():
         p = copy.deepcopy(page); p['data'] = _rename(p['data'], fn); out[name] = p
+    names = {'station_id': 'id_est', 'observed_at': 'ts', 'demand': 'valor', 'released_at': 'pub'}
+    p = copy.deepcopy(page); p['data'] = [{names[k]: v for k, v in r.items()} for r in p['data']]
+    out['campos_desconocidos'] = p
+    p = copy.deepcopy(page); p['rows'] = p.pop('data'); out['pagina_rows'] = p
+    p = copy.deepcopy(page); out['pagina_anidada'] = {'result': {'data': p.pop('data'), **p}}
     p = copy.deepcopy(page); p['items'] = p.pop('data'); out['pagina_items'] = p
     p = copy.deepcopy(page); p['nextCursor'] = p.pop('next_cursor'); out['pagina_cursor_camel'] = p
     return out

@@ -152,9 +152,29 @@ WORD_DATE = re.compile(
     r'(?:[\sT,]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?\s*(Z|UTC|[+-]\d{2}:?\d{2})?')
 
 
+RFC2822 = re.compile(r'[A-Za-z]{3},\s*\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\s+\d{1,2}:\d{2}(:\d{2})?\s*(GMT|UTC|Z|[+-]\d{4})?')
+AM_PM = re.compile(r'(.*?)(\d{1,2})(:\d{2}(?::\d{2})?)\s*([ap])\.?\s*m\.?\s*(Z|UTC|GMT|[+-]\d{2}:?\d{2})?', re.I)
+
+
 def _rewrite(text):
     """Formatos inequívocos que se reescriben como año-mes-día antes de interpretarlos."""
     t = text.strip()
+    if RFC2822.fullmatch(t):  # Sun, 20 Sep 2026 09:00:00 GMT
+        from email.utils import parsedate_to_datetime
+        try:
+            dt = parsedate_to_datetime(t)
+        except (TypeError, ValueError):
+            raise ContractError('Fecha RFC 2822 inválida')
+        return pd.Timestamp(dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).isoformat()
+    m = AM_PM.fullmatch(t)
+    if m:  # 09:00 PM -> 21:00
+        head, hour, rest, half, tz = m.groups()
+        hour = int(hour) % 12 + (12 if half.lower() == 'p' else 0)
+        t = f'{head}{hour:02d}{rest}{tz or ""}'
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}t\d{2}:\d{2}.*', t):  # t/z en minúscula
+        t = t.upper()
+    if t.endswith(' GMT'):
+        t = t[:-4] + 'Z'
     m = COMPACT.fullmatch(t)
     if m:
         y, mo, d, h, mi, sec, frac, tz = m.groups()
@@ -213,8 +233,11 @@ def station(value):
         return f'{value:05d}'
     if isinstance(value, float) and value.is_integer() and 0 <= value < 100_000:
         return f'{int(value):05d}'
-    if isinstance(value, str) and re.fullmatch(r'\d{1,5}', value.strip()):
-        return value.strip().zfill(5)
+    if isinstance(value, str):
+        # "02300", " 2300 ", "2300.0", "ST-02300", "estacion 02300"
+        m = re.fullmatch(r'\s*(?:[A-Za-zÁÉÍÓÚáéíóúñ]+[\s_#:-]*)?(\d{1,5})(?:\.0+)?\s*', value)
+        if m:
+            return m.group(1).zfill(5)
     raise ContractError('Estación inválida')
 
 
@@ -228,11 +251,34 @@ def count(value):
         number = int(value)
     elif isinstance(value, str) and re.fullmatch(r'\s*\d+([.,]0+)?\s*', value):
         number = int(value.strip().replace(',', '.').split('.')[0])
+    elif isinstance(value, str) and re.fullmatch(r'\s*\d{1,3}(,\d{3})+\s*', value):
+        number = int(value.strip().replace(',', ''))  # miles con coma: 1,234
+    elif isinstance(value, str) and re.fullmatch(r'\s*\d{1,3}(\.\d{3})+\s*', value):
+        number = int(value.strip().replace('.', ''))  # miles con punto: 1.234 (1.000 ya se leyó como 1)
+    elif isinstance(value, str) and re.fullmatch(r'\s*\d+(\.\d+)?[eE][+-]?\d+\s*', value):
+        number = float(value)  # notación científica: 1.41e+02
+        if not number.is_integer():
+            raise ContractError('Demanda inválida')
+        number = int(number)
     else:
         raise ContractError('Demanda inválida')
     if number < 0:
         raise ContractError('Demanda negativa')
     return number
+
+
+def minutes(value):
+    """Duración en minutos: 15, "15", "15 min", "15m", "PT15M", "00:15"."""
+    if isinstance(value, str):
+        t = value.strip().lower()
+        m = (re.fullmatch(r'(\d+)\s*(?:m|min|mins|minutos?|minutes?)', t)
+             or re.fullmatch(r'pt(\d+)m', t))
+        if m:
+            return int(m.group(1))
+        m = re.fullmatch(r'(\d{1,2}):(\d{2})', t)
+        if m:
+            return int(m.group(1)) * 60 + int(m.group(2))
+    return count(value)
 
 
 def field_key(row, name):
@@ -248,6 +294,78 @@ def field(row, name):
     return row[field_key(row, name)]
 
 
+PAGE_ROWS = ('data', 'items', 'results', 'rows', 'records', 'observations', 'observaciones')
+
+
+def page_parts(page, depth=0):
+    """(filas, next_cursor) de una página aunque cambie su envoltura: `data`, `items`,
+    `rows`…, una única lista de objetos, o todo dentro de un objeto (un nivel)."""
+    if isinstance(page, list):
+        return page, None
+    if not isinstance(page, dict):
+        raise ContractError('Página inválida')
+    p = canonical_keys(page, PAGE_ROWS + ('next_cursor',))
+    for k in PAGE_ROWS:
+        if isinstance(p.get(k), list):
+            return p[k], p.get('next_cursor')
+    lists = [v for v in p.values() if isinstance(v, list) and all(isinstance(x, dict) for x in v)]
+    if len(lists) == 1:
+        return lists[0], p.get('next_cursor')
+    inner = [v for v in p.values() if isinstance(v, dict)]
+    if depth == 0 and len(inner) == 1:
+        rows, cursor = page_parts(inner[0], 1)
+        return rows, cursor if cursor is not None else p.get('next_cursor')
+    raise ContractError('Página sin filas reconocibles')
+
+
+def _infer_columns(rows):
+    """Si los nombres de campos no coinciden con ningún alias, reconoce cada columna por su
+    contenido: dos columnas de fechas (la observación va en la grilla de 15 min y es la más
+    antigua), códigos de estación y conteos. Solo devuelve lo que queda sin ambigüedad."""
+    sample = [r for r in rows if isinstance(r, dict)][:200]
+    if not sample:
+        return {}
+    keys = [k for k in sample[0] if all(k in r for r in sample)]
+    dates, stations, counts = {}, [], []
+    for k in keys:
+        values = [r[k] for r in sample]
+        try:
+            parsed = parse_instants(values)
+            if all(isinstance(v, str) or (isinstance(v, (int, float)) and abs(v) >= 1e9) for v in values):
+                dates[k] = parsed
+                continue
+        except (ContractError, ValueError, TypeError, OverflowError):
+            pass
+        try:
+            [station(v) for v in values]; stations.append(k)
+        except ContractError:
+            pass
+        try:
+            [count(v) for v in values]; counts.append(k)
+        except ContractError:
+            pass
+    out = {}
+    if len(dates) in (1, 2):
+        aligned = [k for k, p in dates.items() if all(ts.value % GRID_NS == 0 for ts in p)]
+        if len(dates) == 1:
+            out['observed_at'] = out['released_at'] = next(iter(dates))
+        else:
+            a, b = dates
+            first = a if pd.Series(dates[a]).median() <= pd.Series(dates[b]).median() else b
+            out['observed_at'] = first if first in aligned or len(aligned) != 1 else aligned[0]
+            out['released_at'] = b if out['observed_at'] == a else a
+    numeric = [k for k in keys if k not in dates]
+    if len(numeric) == 2 and set(numeric) <= set(stations) | set(counts):
+        # Estación: la columna con ceros a la izquierda o, si no, con menos valores distintos.
+        zero = [k for k in numeric if any(isinstance(r[k], str) and r[k].strip().startswith('0') for r in sample)]
+        distinct = {k: len({str(r[k]) for r in sample}) for k in numeric}
+        st = zero[0] if len(zero) == 1 else min(numeric, key=distinct.get) if len(set(distinct.values())) == 2 else None
+        dm = next((k for k in numeric if k != st), None)
+        if st in stations and dm in counts:
+            out['station_id'], out['demand'] = st, dm
+    return out
+
+
 def normalize_observations(rows, near=None):
     """Devuelve (filas_canónicas, cuarentena, huella). Nunca lanza por una fila.
 
@@ -255,14 +373,27 @@ def normalize_observations(rows, near=None):
     """
     good, quarantine, fingerprint = [], [], {}
     staged = []
+    inferred = None
+
+    def get_key(raw, name):
+        nonlocal inferred
+        try:
+            return field_key(raw, name)
+        except ContractError:
+            if inferred is None:
+                inferred = _infer_columns(rows)
+            if inferred.get(name) in raw:
+                return inferred[name]
+            raise
+
     for raw in rows:
         try:
             if not isinstance(raw, dict):
                 raise ContractError('Fila no es un objeto')
-            staged.append((raw, station(field(raw, 'station_id')), count(field(raw, 'demand')),
-                           field(raw, 'observed_at'), field(raw, 'released_at')))
-            for name in ALIASES:
-                key = field_key(raw, name)
+            keys = {name: get_key(raw, name) for name in ALIASES}
+            staged.append((raw, station(raw[keys['station_id']]), count(raw[keys['demand']]),
+                           raw[keys['observed_at']], raw[keys['released_at']]))
+            for name, key in keys.items():
                 fingerprint.setdefault(name, set()).add(f'{key}:{pattern(raw[key])}')
         except ContractError as exc:
             quarantine.append({'row': raw, 'reason': str(exc)})
@@ -282,6 +413,31 @@ def normalize_observations(rows, near=None):
     return good, quarantine, {k: sorted(v) for k, v in fingerprint.items()}
 
 
+TARGET_LISTS = ('targets', 'items', 'objetivos', 'predictions', 'required_predictions', 'pronosticos', 'data')
+
+
+def _unwrap_cycle(raw, depth=0):
+    """Contrato con claves canónicas aunque venga dentro de otro objeto o con `targets`
+    bajo otro nombre (o como la única lista de objetos con estación)."""
+    if not isinstance(raw, dict):
+        raise ContractError('Contrato inválido')
+    c = canonical_keys(dict(raw), CYCLE_FIELDS)
+    if 'cycle_id' not in c and depth == 0:
+        inner = [v for v in c.values() if isinstance(v, dict) and 'cycleid' in {norm_key(k) for k in v}]
+        if len(inner) == 1:
+            return _unwrap_cycle(inner[0], 1)
+    if not isinstance(c.get('targets'), list):
+        named = {norm_key(n) for n in TARGET_LISTS}
+        found = [k for k, v in c.items() if norm_key(k) in named and isinstance(v, list)]
+        if not found:
+            found = [k for k, v in c.items() if isinstance(v, list) and v and all(isinstance(x, dict) for x in v)
+                     and all('station' in ''.join(norm_key(kk) for kk in x) or 'estacion' in ''.join(norm_key(kk) for kk in x)
+                             for x in v)]
+        if len(found) == 1:
+            c['targets'] = c.pop(found[0])
+    return c
+
+
 def _cycle_reference(cycle_id):
     m = re.search(r'(\d{8}T\d{6}Z)', str(cycle_id))
     return pd.Timestamp(datetime.strptime(m.group(1), '%Y%m%dT%H%M%SZ'), tz='UTC') if m else None
@@ -289,7 +445,7 @@ def _cycle_reference(cycle_id):
 
 def normalize_cycle_contract(raw):
     """Contrato del ciclo en formato canónico, verificado por consistencia interna."""
-    c = canonical_keys(dict(raw), CYCLE_FIELDS)
+    c = _unwrap_cycle(raw)
     if not isinstance(c.get('cycle_id'), str) or not isinstance(c.get('targets'), list) or not c['targets']:
         raise ContractError('Contrato sin cycle_id o targets')
     state = boolean(c.get('state'))
@@ -306,13 +462,13 @@ def normalize_cycle_contract(raw):
     cutoff = parsed[sim_keys.index('data_cutoff')] if 'data_cutoff' in sim_keys else None
     if cutoff is None:
         raise ContractError('Contrato sin data_cutoff')
-    horizons = sorted({int(count(h)) for h in c.get('horizons_minutes') or []})
+    horizons = sorted({minutes(h) for h in c.get('horizons_minutes') or []})
     for t, ts in zip(targets, parsed[len(sim_keys):]):
         t['station_id'] = station(t.get('station_id'))
         t['target_at'] = canonical(ts)
         lead = (ts - cutoff).total_seconds() / 60
         if 'horizon_minutes' in t:
-            t['horizon_minutes'] = count(t['horizon_minutes'])
+            t['horizon_minutes'] = minutes(t['horizon_minutes'])
             if lead != t['horizon_minutes']:
                 raise ContractError('target_at no coincide con horizon_minutes')
         if horizons and lead not in horizons:
@@ -342,7 +498,7 @@ def _rebuild_instants(c, sim_keys, targets, ref, exc):
     if ref is None:
         raise exc
     try:
-        horizons = [count(t['horizon_minutes']) for t in targets]
+        horizons = [minutes(t['horizon_minutes']) for t in targets]
     except (KeyError, ContractError):
         raise exc
     by_key = {}

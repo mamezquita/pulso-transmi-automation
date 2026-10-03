@@ -36,8 +36,6 @@ class _Etapa:
             self.row['estado'] = 'error'; self.row['resultado'] = {'error_type': exc_type.__name__}
         return False
 
-EXPECTED_PARTICIPANT = 'stu_fbbcf1d8318b4f75990c2b582255bdba'
-
 EXPECTED_PARTICIPANT = os.getenv('EXPECTED_PARTICIPANT_ID', '')
 
 
