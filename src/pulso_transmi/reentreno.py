@@ -200,7 +200,7 @@ def load_data():
 
 
 # ---------- refresco horario ----------
-REFRESH_MIN_NEW_DATA = pd.Timedelta(minutes=45)
+REFRESH_MIN_NEW_DATA = pd.Timedelta(minutes=30)  # el tiempo simulado avanza ~1 h por hora
 REFRESH_KEEP_HOURS = 48
 
 

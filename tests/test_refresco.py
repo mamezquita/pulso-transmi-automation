@@ -69,7 +69,7 @@ def test_refresh_retrains_same_config_with_newer_data_as_next_revision(wired):
 
 def test_refresh_skipped_when_model_is_up_to_date_or_has_no_config(wired):
     published, _ = wired
-    assert reentreno.refresh(Store(active_model(IDX[-3])))['status'] == 'sin_refresco'
+    assert reentreno.refresh(Store(active_model(IDX[-2])))['status'] == 'sin_refresco'
     assert reentreno.refresh(Store(SimpleNamespace(end='2026-09-01T00:00:00Z')))['status'] == 'sin_refresco'
     assert published == []
 
