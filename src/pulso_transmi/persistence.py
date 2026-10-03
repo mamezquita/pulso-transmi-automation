@@ -139,6 +139,9 @@ class RemoteStore:
                      headers={'Prefer': 'resolution=ignore-duplicates'},
                      json={'ciclo_id': cycle_id, 'version': selection['version'], 'diagnostico': selection})
 
+    def record_format(self, source, shape, sample):
+        return self.rpc('registrar_formato', p_fuente=source, p_huella=shape, p_muestra=sample)
+
     def review_delivery_version(self):
         return self.rpc('revisar_version_envio')
 

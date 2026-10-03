@@ -3,6 +3,7 @@ import argparse
 import json
 from pathlib import Path
 import httpx
+from . import diagnostico
 from .client import DEFAULT_BASE_URL
 from .operational import load_env
 from .persistence import RemoteStore
@@ -28,7 +29,8 @@ def collect(store,api,max_pages=1000):
         params={'limit':1000}
         if cursor:params['cursor']=cursor
         r=api.get('/v1/stream/observations',params=params);r.raise_for_status()
-        page=canonical_keys(r.json(),('data','items','results','next_cursor'))
+        raw=r.json();diagnostico.capture('stream',raw)
+        page=canonical_keys(raw,('data','items','results','next_cursor'))
         rows=next((page[k] for k in ('data','items','results') if k in page),None)
         next_cursor=page.get('next_cursor')
         if not isinstance(rows,list) or len(rows)>1000:raise ContractError('Página inválida')

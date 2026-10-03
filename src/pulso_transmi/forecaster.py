@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .client import DEFAULT_BASE_URL
+from . import diagnostico
 from .contract import normalize_receipt
 from .operational import load_env,normalize_cycle
 from .persistence import RemoteStore
@@ -101,6 +102,7 @@ def forecast(store,api,*,submit=False,token=None,cycle=None):
         raise
     try:body=r.json()
     except ValueError:body={'message':'non_json_response'}
+    diagnostico.capture('recibo',body)
     if r.is_error:
         store.finish(job,error={'http_status':r.status_code,'response':body})
         r.raise_for_status()

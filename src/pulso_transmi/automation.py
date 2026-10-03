@@ -14,7 +14,8 @@ from .collector import collect
 from .forecaster import forecast
 from .operational import load_env
 from .persistence import RemoteStore
-from .contract import ContractError
+from . import diagnostico
+from .contract import ContractError, canonical_keys
 from .prepare_submission import check_current_cycle
 from .shadow import run_shadow
 
@@ -51,10 +52,10 @@ def execute(store, api, *, submit=False, token=None):
                 raise ValueError('Falta PULSO_API_KEY')
             response = api.get('/v1/me', headers={'Authorization': f'Bearer {token}'})
             response.raise_for_status()
-            identity = response.json()
-            if identity['participant_id'] != EXPECTED_PARTICIPANT:
+            identity = canonical_keys(response.json(), ('participant_id', 'display_name'))
+            if str(identity.get('participant_id')).strip() != str(EXPECTED_PARTICIPANT):
                 raise ValueError('La API key no pertenece al participante esperado')
-            result['participant'] = identity['display_name']
+            result['participant'] = identity.get('display_name')
         try:
             with _Etapa(result, 'colector') as et:
                 result['collector'] = collect(store, api)
@@ -98,6 +99,11 @@ def execute(store, api, *, submit=False, token=None):
         result['version_review'] = store.review_delivery_version()
     except Exception as exc:
         result['version_review'] = {'status': 'error', 'error_type': type(exc).__name__}
+    # Diagnóstico de formato de la API (ciclo, stream, recibo): solo registra cambios.
+    try:
+        result['formato'] = diagnostico.flush(store)
+    except Exception as exc:
+        result['formato'] = {'status': 'error', 'error_type': type(exc).__name__}
     try:
         store.finish_attempt(result['attempt_id'], result)
     except Exception as exc:
