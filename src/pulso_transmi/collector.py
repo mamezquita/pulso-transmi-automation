@@ -29,9 +29,10 @@ def collect(store,api,max_pages=1000):
         params={'limit':1000}
         if cursor:params['cursor']=cursor
         r=api.get('/v1/stream/observations',params=params);r.raise_for_status()
-        raw=r.json();diagnostico.capture('stream',raw)
+        raw=r.json()
         page=canonical_keys(raw,('data','items','results','next_cursor'))
         rows=next((page[k] for k in ('data','items','results') if k in page),None)
+        if rows:diagnostico.capture('stream',raw)  # páginas vacías no dicen nada del formato
         next_cursor=page.get('next_cursor')
         if not isinstance(rows,list) or len(rows)>1000:raise ContractError('Página inválida')
         good,bad,fingerprint=normalize_observations(rows,near=near)

@@ -48,9 +48,7 @@ def shape(obj, prefix=''):
             for path, pat in shape(item, prefix + '[]').items():
                 merged.setdefault(path, set()).add(pat)
         out = {p: '|'.join(sorted(v)) for p, v in merged.items()}
-        if not obj:
-            out[prefix + '[]'] = 'vacia'
-    else:
+    elif obj is not None:  # nulos (p. ej. next_cursor al final) no son un cambio de formato
         out[prefix or '.'] = _scalar(obj)
     return out
 
