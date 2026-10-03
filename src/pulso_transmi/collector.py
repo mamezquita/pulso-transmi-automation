@@ -6,7 +6,7 @@ import httpx
 from .client import DEFAULT_BASE_URL
 from .operational import load_env
 from .persistence import RemoteStore
-from .contract import ContractError,normalize_observations
+from .contract import ContractError,canonical_keys,normalize_observations
 
 
 QUARANTINE_LIMIT=1000
@@ -28,9 +28,9 @@ def collect(store,api,max_pages=1000):
         params={'limit':1000}
         if cursor:params['cursor']=cursor
         r=api.get('/v1/stream/observations',params=params);r.raise_for_status()
-        page=r.json()
+        page=canonical_keys(r.json(),('data','items','results','next_cursor'))
         rows=next((page[k] for k in ('data','items','results') if k in page),None)
-        next_cursor=page.get('next_cursor',page.get('nextCursor'))
+        next_cursor=page.get('next_cursor')
         if not isinstance(rows,list) or len(rows)>1000:raise ContractError('Página inválida')
         good,bad,fingerprint=normalize_observations(rows,near=near)
         if rows and not good:

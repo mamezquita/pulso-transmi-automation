@@ -136,3 +136,24 @@ def test_calendar_artifact_loads_in_fresh_process_without_main_alias(tmp_path):
         "import joblib,sys; m=joblib.load(sys.argv[1]); assert type(m).__module__=='pulso_transmi.operational'; print('portable')",str(path)],cwd=tmp_path,capture_output=True,text=True)
     assert result.returncode==0,result.stderr
     assert result.stdout.strip()=='portable'
+
+
+def test_format_drift_cycle_and_odd_receipt_still_deliver_and_register():
+    # Ciclo con claves en MAYÚSCULAS, estado booleano, fechas ilegibles y recibo con status 'yes'.
+    drifted={'CYCLE_ID':'cyc_official-x_20260911T160000Z','STATE':True,'DATA_CUTOFF':'pronto',
+             'CLOSES_AT':'en un rato','EXPECTED_PREDICTIONS':'1',
+             'TARGETS':[{'STATION_ID':1,'TARGET_AT':'??','HORIZON_MINUTES':'15'}]}
+    sent=[]
+    def handler(r):
+        if r.method=='GET':return httpx.Response(200,json=drifted)
+        sent.append(json.loads(r.content))
+        return httpx.Response(201,json={'submissionId':'sub_x','status':'yes'})
+    store=FakeStore()
+    with httpx.Client(base_url='https://pulso-transmi.72-60-245-2.sslip.io',transport=httpx.MockTransport(handler)) as api:
+        r=forecast(store,api,submit=True,token='test')
+    assert r['status']=='accepted'
+    p=sent[0]
+    assert p['cycle_id']=='cyc_official-x_20260911T160000Z' and p['data_cutoff']=='2026-09-11T16:00:00Z'
+    assert p['predictions']==[{'station_id':'00001','target_at':'2026-09-11T16:15:00Z','value':42.0}]
+    receipt=store.record['respuesta']['response']
+    assert receipt['status']=='accepted' and receipt['submission_id']=='sub_x' and receipt['raw']['status']=='yes'

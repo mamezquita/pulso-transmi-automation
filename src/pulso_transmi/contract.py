@@ -26,6 +26,48 @@ ALIASES = {
 }
 
 
+CYCLE_FIELDS = ('cycle_id', 'state', 'origin_at', 'data_cutoff', 'opens_at', 'closes_at', 'forecast_start_at',
+                'forecast_end_at', 'station_count', 'horizons_minutes', 'expected_predictions', 'targets')
+TARGET_FIELDS = ('station_id', 'target_at', 'horizon_minutes')
+RECEIPT_FIELDS = ('status', 'submission_id', 'received_at', 'closes_at', 'attempt', 'is_official', 'payload_hash')
+_MONTH_NAMES = [
+    ('ene', 'enero', 'jan', 'january'), ('feb', 'febrero', 'february'), ('mar', 'marzo', 'march'),
+    ('abr', 'abril', 'apr', 'april'), ('may', 'mayo'), ('jun', 'junio', 'june'), ('jul', 'julio', 'july'),
+    ('ago', 'agosto', 'aug', 'august'), ('sep', 'sept', 'septiembre', 'setiembre', 'september'),
+    ('oct', 'octubre', 'october'), ('nov', 'noviembre', 'november'), ('dic', 'diciembre', 'dec', 'december')]
+MONTHS = {m: i + 1 for i, names in enumerate(_MONTH_NAMES) for m in names}
+TRUE_WORDS = {'true', 't', 'yes', 'y', 'si', 'sí', 's', '1', 'open', 'opened', 'abierto', 'abierta', 'activo', 'on'}
+FALSE_WORDS = {'false', 'f', 'no', 'n', '0', 'closed', 'close', 'cerrado', 'cerrada', 'inactivo', 'off'}
+ACCEPTED_WORDS = {'accepted', 'aceptado', 'aceptada', 'ok', 'success', 'successful', 'exito', 'éxito', 'received',
+                  'recibido'}
+
+
+def norm_key(key):
+    """`observedAt`, `OBSERVED_AT` y `observed-at` son el mismo campo."""
+    return re.sub(r'[^a-z0-9]', '', str(key).lower())
+
+
+def canonical_keys(obj, names):
+    """Renombra a su forma canónica las claves que solo difieren en formato."""
+    if not isinstance(obj, dict):
+        return obj
+    lookup = {norm_key(n): n for n in names}
+    out = {}
+    for k, v in obj.items():
+        out[lookup.get(norm_key(k), k)] = v
+    return out
+
+
+def boolean(value):
+    """True/False desde 1/0, yes/no, sí/no, true/false, open/closed…; None si no se reconoce."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    text = str(value).strip().lower()
+    return True if text in TRUE_WORDS else False if text in FALSE_WORDS else None
+
+
 class ContractError(ValueError):
     """Dato que no se puede interpretar de forma inequívoca."""
 
@@ -104,9 +146,39 @@ def parse_instants(values, near=None):
     return out
 
 
+COMPACT = re.compile(r'(\d{4})(\d{2})(\d{2})[T ]?(\d{2})(\d{2})(\d{2})?(\.\d+)?\s*(Z|UTC|[+-]\d{2}:?\d{2})?')
+WORD_DATE = re.compile(
+    r'(?:(\d{1,2})[\s./-]+([a-záéíóú]+)\.?[\s./-]+(\d{4})|([a-záéíóú]+)\.?\s+(\d{1,2}),?\s+(\d{4}))'
+    r'(?:[\sT,]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?\s*(Z|UTC|[+-]\d{2}:?\d{2})?')
+
+
+def _rewrite(text):
+    """Formatos inequívocos que se reescriben como año-mes-día antes de interpretarlos."""
+    t = text.strip()
+    m = COMPACT.fullmatch(t)
+    if m:
+        y, mo, d, h, mi, sec, frac, tz = m.groups()
+        return f"{y}-{mo}-{d}T{h}:{mi}:{sec or '00'}{frac or ''}{(tz or '').replace('UTC', 'Z')}"
+    m = WORD_DATE.fullmatch(t.lower())
+    if m:
+        d1, mon1, y1, mon2, d2, y2, h, mi, sec, tz = m.groups()
+        month = MONTHS.get(mon1 or mon2)
+        if month is None:
+            raise ContractError('Mes no reconocido')
+        tz = (tz or '').upper().replace('UTC', 'Z')
+        return f"{y1 or y2}-{month:02d}-{int(d1 or d2):02d} {int(h or 0):02d}:{mi or '00'}:{sec or '00'}{tz}"
+    return t
+
+
 def _parse_group(values, near):
     if all(isinstance(v, str) and ISO.fullmatch(v.strip()) for v in values):
         return [pd.Timestamp(v.strip()).tz_convert('UTC') for v in values]
+    if all(isinstance(v, str) and re.fullmatch(r'\s*\d{9,19}(\.\d+)?\s*', v) for v in values):
+        return [_epoch(float(v)) for v in values]  # epoch como texto
+    if all(isinstance(v, str) for v in values):
+        values = [_rewrite(v) for v in values]
+        if all(ISO.fullmatch(v) for v in values):
+            return [pd.Timestamp(v).tz_convert('UTC') for v in values]
     if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
         return [_epoch(v) for v in values]
     if not all(isinstance(v, str) for v in values):
@@ -147,15 +219,15 @@ def station(value):
 
 
 def count(value):
-    """Entero no negativo exacto; acepta 12, 12.0 y "12" pero no 12.5."""
+    """Entero no negativo exacto; acepta 12, 12.0, "12", "12.0" y "12,0" pero no 12.5."""
     if isinstance(value, bool):
         raise ContractError('Demanda inválida')
     if isinstance(value, int):
         number = value
     elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
         number = int(value)
-    elif isinstance(value, str) and re.fullmatch(r'\s*\d+(\.0+)?\s*', value):
-        number = int(float(value))
+    elif isinstance(value, str) and re.fullmatch(r'\s*\d+([.,]0+)?\s*', value):
+        number = int(value.strip().replace(',', '.').split('.')[0])
     else:
         raise ContractError('Demanda inválida')
     if number < 0:
@@ -163,11 +235,17 @@ def count(value):
     return number
 
 
-def field(row, name):
-    for key in ALIASES[name]:
-        if key in row:
-            return row[key]
+def field_key(row, name):
+    """Clave de `row` que corresponde al campo `name` (alias y variantes de formato)."""
+    wanted = {norm_key(a) for a in ALIASES[name]}
+    for key in row:
+        if norm_key(key) in wanted:
+            return key
     raise ContractError(f'Falta el campo {name}')
+
+
+def field(row, name):
+    return row[field_key(row, name)]
 
 
 def normalize_observations(rows, near=None):
@@ -184,7 +262,7 @@ def normalize_observations(rows, near=None):
             staged.append((raw, station(field(raw, 'station_id')), count(field(raw, 'demand')),
                            field(raw, 'observed_at'), field(raw, 'released_at')))
             for name in ALIASES:
-                key = next(k for k in ALIASES[name] if k in raw)
+                key = field_key(raw, name)
                 fingerprint.setdefault(name, set()).add(f'{key}:{pattern(raw[key])}')
         except ContractError as exc:
             quarantine.append({'row': raw, 'reason': str(exc)})
@@ -211,14 +289,18 @@ def _cycle_reference(cycle_id):
 
 def normalize_cycle_contract(raw):
     """Contrato del ciclo en formato canónico, verificado por consistencia interna."""
-    c = dict(raw)
+    c = canonical_keys(dict(raw), CYCLE_FIELDS)
     if not isinstance(c.get('cycle_id'), str) or not isinstance(c.get('targets'), list) or not c['targets']:
         raise ContractError('Contrato sin cycle_id o targets')
-    c['state'] = str(c.get('state', '')).strip().lower()
+    state = boolean(c.get('state'))
+    c['state'] = 'open' if state is True else 'closed' if state is False else str(c.get('state', '')).strip().lower()
     ref = _cycle_reference(c['cycle_id'])
     sim_keys = [k for k in ('data_cutoff', 'origin_at', 'forecast_start_at', 'forecast_end_at') if c.get(k) is not None]
-    targets = [dict(t) for t in c['targets']]
-    parsed = parse_instants([c[k] for k in sim_keys] + [t.get('target_at') for t in targets], near=ref)
+    targets = [canonical_keys(dict(t), TARGET_FIELDS) for t in c['targets']]
+    try:
+        parsed = parse_instants([c[k] for k in sim_keys] + [t.get('target_at') for t in targets], near=ref)
+    except ContractError as exc:
+        parsed = _rebuild_instants(c, sim_keys, targets, ref, exc)
     for k, ts in zip(sim_keys, parsed):
         c[k] = canonical(ts)
     cutoff = parsed[sim_keys.index('data_cutoff')] if 'data_cutoff' in sim_keys else None
@@ -241,8 +323,57 @@ def normalize_cycle_contract(raw):
     for k in ('expected_predictions', 'station_count'):
         if k in c:
             c[k] = count(c[k])
-    real = [k for k in ('opens_at', 'closes_at') if c.get(k) is not None]
-    if real:
-        for k, ts in zip(real, parse_instants([c[k] for k in real], near=datetime.now(timezone.utc))):
-            c[k] = canonical(ts)
+    for k in ('opens_at', 'closes_at'):
+        if c.get(k) is None:
+            continue
+        try:
+            c[k] = canonical(parse_instants([c[k]], near=datetime.now(timezone.utc))[0])
+        except ContractError:
+            # Hora real ilegible: no se inventa. El envío confía en la respuesta del servidor.
+            c.setdefault('formato_no_leido', []).append(k)
+            c[k] = None
     return c
+
+
+def _rebuild_instants(c, sim_keys, targets, ref, exc):
+    """Si las fechas del contrato no se pueden leer, se reconstruyen con lo que es fijo:
+    el corte viene en el `cycle_id` y cada objetivo es corte + su horizonte. Solo si todo
+    objetivo trae su horizonte legible; si no, el error original se mantiene."""
+    if ref is None:
+        raise exc
+    try:
+        horizons = [count(t['horizon_minutes']) for t in targets]
+    except (KeyError, ContractError):
+        raise exc
+    by_key = {}
+    for k in sim_keys:
+        try:
+            by_key[k] = parse_instants([c[k]], near=ref)[0]
+        except ContractError:
+            by_key[k] = None
+    if by_key.get('data_cutoff') not in (None, ref):
+        raise ContractError('data_cutoff legible no coincide con el cycle_id')
+    by_key['data_cutoff'] = ref
+    known = {'origin_at': ref, 'forecast_start_at': ref + pd.Timedelta(minutes=min(horizons)),
+             'forecast_end_at': ref + pd.Timedelta(minutes=max(horizons))}
+    c['reconstruido'] = f'fechas reconstruidas desde cycle_id y horizontes ({exc})'
+    return [by_key[k] if by_key[k] is not None else known[k] for k in sim_keys] + \
+           [ref + pd.Timedelta(minutes=h) for h in horizons]
+
+
+def normalize_receipt(body, http_status):
+    """Recibo del POST en forma canónica: `status` = 'accepted' si el servidor lo aceptó
+    (2xx y estado afirmativo en cualquier formato) y `submission_id` con su nombre canónico.
+    El original se conserva en `raw` para diagnóstico."""
+    if not isinstance(body, dict):
+        return body
+    b = canonical_keys(dict(body), RECEIPT_FIELDS)
+    status = b.get('status')
+    text = str(status).strip().lower()
+    if 200 <= int(http_status) < 300 and (boolean(status) is True or text in ACCEPTED_WORDS):
+        b['status'] = 'accepted'
+    if b.get('submission_id') is not None:
+        b['submission_id'] = str(b['submission_id']).strip()
+    if b != body:
+        b['raw'] = body
+    return b

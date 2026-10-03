@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .client import DEFAULT_BASE_URL
+from .contract import normalize_receipt
 from .operational import load_env,normalize_cycle
 from .persistence import RemoteStore
 from .prepare_submission import check_current_cycle,timestamp,validate_payload
@@ -89,7 +90,9 @@ def forecast(store,api,*,submit=False,token=None,cycle=None):
     live=check_current_cycle(DEFAULT_BASE_URL,api)
     if live is None or live['cycle_id']!=job['ciclo_id'] or live['state']!='open':
         return {'status':'cycle_closed_or_changed','submitted':False}
-    if timestamp(datetime.now(timezone.utc))>=timestamp(live['closes_at']):return {'status':'cycle_closed','submitted':False}
+    # closes_at ilegible (drift de formato): no se inventa; decide la respuesta del servidor.
+    if live.get('closes_at') and timestamp(datetime.now(timezone.utc))>=timestamp(live['closes_at']):
+        return {'status':'cycle_closed','submitted':False}
     validate_payload(payload,normalize_cycle(live))
     try:
         r=api.post('/v1/submissions',json=payload,headers={'Authorization':f'Bearer {token}','Idempotency-Key':job['client_run_id']})
@@ -101,7 +104,7 @@ def forecast(store,api,*,submit=False,token=None,cycle=None):
     if r.is_error:
         store.finish(job,error={'http_status':r.status_code,'response':body})
         r.raise_for_status()
-    receipt={'http_status':r.status_code,'response':body}
+    receipt={'http_status':r.status_code,'response':normalize_receipt(body,r.status_code)}
     # Si falla este guardado después del POST, el próximo runner reutiliza payload y clave.
     store.finish(job,response=receipt)
     return {'status':'accepted','submitted':True,'receipt':receipt}
