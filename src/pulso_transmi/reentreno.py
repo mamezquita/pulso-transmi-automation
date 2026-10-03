@@ -7,6 +7,9 @@ validación temporal. Si llega al umbral de cambio de modelo, se queda con esa f
 (nueva revisión). Si no, se prueban todas las demás familias con el mismo rigor y se
 cambia solo si la mejor supera a LightGBM por el margen pactado (nueva versión).
 
+Sin disparo, refresca el modelo activo: misma configuración con los datos más recientes
+(nueva revisión). Con --sesion corre una pasada por hora sin depender del cron.
+
 Nunca corre dentro de la sesión de envíos. Activa solo entre los minutos 10 y 30 de
 una hora y después de confirmar la entrega de esa hora.
 """
@@ -178,13 +181,105 @@ def activate(store, version_mayor, revision, motivo):
     # El modelo con historia ya incorpora el nivel reciente: corrección 1.0 (sin capa extra) y
     # respaldo 1.0 para que la reversión automática no vuelva a una corrección pensada para el
     # modelo de calendario.
-    store.request('PATCH', '/rest/v1/version_envio', params={'nombre': 'eq.demanda'},
-                  json={'version': '1.0', 'version_respaldo': '1.0', 'motivo': f'Modelo {version_mayor} r{revision}: {motivo}'[:500]})
+    current = store.rows('version_envio', select='version,version_respaldo', nombre='eq.demanda')
+    if not current or (current[0]['version'], current[0]['version_respaldo']) != ('1.0', '1.0'):
+        store.request('PATCH', '/rest/v1/version_envio', params={'nombre': 'eq.demanda'},
+                      json={'version': '1.0', 'version_respaldo': '1.0', 'motivo': f'Modelo {version_mayor} r{revision}: {motivo}'[:500]})
     return store.rpc('activar_modelo', p_version_mayor=version_mayor, p_revision=revision, p_motivo=motivo[:500])
 
 
+def load_data():
+    for attempt in range(3):
+        try:
+            actual, model_pivot, _, _ = bt.load_remote()
+            origins = bt.origins_for(actual, actual.index[0] + pd.Timedelta(days=1, hours=4))
+            return actual, origins
+        except Exception as exc:
+            log(f'Reintento de carga ({type(exc).__name__})'); time.sleep(20)
+    raise RuntimeError('No se pudieron cargar los datos')
+
+
+# ---------- refresco horario ----------
+REFRESH_MIN_NEW_DATA = pd.Timedelta(minutes=45)
+REFRESH_KEEP_HOURS = 48
+
+
+def refresh(store, dry_run=False, activation_wait=80 * 60):
+    """Misma configuración del modelo activo, reentrenada con los datos más recientes.
+    El ruido cambia rápido: un modelo con datos de 12 h atrás perdió 11 puntos en la
+    prueba (2-oct). Queda como nueva revisión del mismo modelo, activada en ventana segura."""
+    record = store.active_model()
+    model = store.load_model(record)
+    familia, cfg = getattr(model, 'familia', None), getattr(model, 'config', None)
+    if not familia or not cfg:
+        return {'status': 'sin_refresco', 'motivo': 'el modelo activo no tiene configuración para reentrenar'}
+    actual, origins = load_data()
+    latest = actual.dropna(how='all').index.max()
+    if latest < pd.Timestamp(model.end) + REFRESH_MIN_NEW_DATA:
+        return {'status': 'sin_refresco', 'motivo': 'el modelo activo ya tiene los datos recientes'}
+    active = store.rows('modelo_activo_detalle', select='version_mayor,revision,metricas')[0]
+    major, base_rev = active['version_mayor'], active['revision']
+    motivo = f'Refresco horario de {major} r{base_rev}: misma configuración con datos hasta {latest.isoformat()}'
+    log(motivo)
+    if dry_run:
+        final = bq.build_model(familia, cfg).fit(actual, origins)
+        return {'status': 'simulado', 'motivo': motivo, 'end': final.end}
+    rid = store.request('POST', '/rest/v1/reentreno', headers={'Prefer': 'return=representation'}, json={
+        'disparo': {'motivo': 'refresco horario', 'modelo': f'{major} r{base_rev}'}, 'fase': 'refresco',
+        'github_run_id': os.getenv('GITHUB_RUN_ID')}).json()[0]['reentreno_id']
+    try:
+        final = bq.build_model(familia, cfg).fit(actual, origins)
+        if pd.Timestamp(final.end) <= pd.Timestamp(model.end):
+            raise ValueError('El refresco no agregó datos nuevos')
+        metricas = active.get('metricas') or {}
+        result = {'config': {**cfg, 'origen': 'refresco', 'refresco_de': f'{major} r{base_rev}'},
+                  'cv_accuracy': metricas.get('cv_accuracy'), 'pliegues': None,
+                  'prueba': {k: v for k, v in metricas.items() if k != 'cv_accuracy'}}
+        revs = store.rows('version_modelo', select='revision', version_mayor=f'eq.{major}', order='revision.desc', limit=1)
+        rev = revs[0]['revision'] + 1
+        digest, version = publish(store, final, major, rev, familia, result, motivo)
+        log(f'Registrado {version} ({digest[:12]})')
+        patch = {'estado': 'pendiente_activacion', 'decision': 'refresco', 'motivo': motivo,
+                 'version_mayor': major, 'revision': rev}
+        store.request('PATCH', '/rest/v1/reentreno', params={'reentreno_id': f'eq.{rid}'}, json=patch)
+        if not wait_safe_window(store, max_wait=activation_wait):
+            log('Sin ventana segura; el refresco queda pendiente para la próxima iteración')
+            return {'status': 'pendiente_activacion', 'decision': 'refresco', 'motivo': motivo}
+        log(f'Activado: {activate(store, major, rev, motivo)}')
+        store.request('PATCH', '/rest/v1/reentreno', params={'reentreno_id': f'eq.{rid}'}, json={
+            'estado': 'completado', 'terminado_en': datetime.now(timezone.utc).isoformat()})
+    except Exception as exc:
+        store.request('PATCH', '/rest/v1/reentreno', params={'reentreno_id': f'eq.{rid}'}, json={
+            'terminado_en': datetime.now(timezone.utc).isoformat(), 'estado': 'error', 'error': str(exc)[:500]})
+        raise
+    try:
+        log(f'Artefactos de refrescos antiguos borrados: {purge_old_refreshes(store)}')
+    except Exception as exc:  # limpieza; nunca bloquea
+        log(f'No se pudo limpiar artefactos antiguos ({type(exc).__name__})')
+    return {'status': 'refrescado', 'decision': 'refresco', 'motivo': motivo, 'modelo': f'{major} r{rev}'}
+
+
+def purge_old_refreshes(store, keep_hours=REFRESH_KEEP_HOURS, now=None):
+    """Borra del storage los artefactos de refrescos con más de `keep_hours` que no estén
+    activos (el registro y sus métricas se conservan; las búsquedas completas nunca se borran)."""
+    now = now or datetime.now(timezone.utc)
+    active = store.active_model()['sha256']
+    cutoff = (now - pd.Timedelta(hours=keep_hours)).isoformat()
+    old = store.rows('version_modelo', select='modelo_sha256', **{'config->>origen': 'eq.refresco', 'creada_en': f'lt.{cutoff}'})
+    removed = 0
+    for row in old:
+        if row['modelo_sha256'] == active:
+            continue
+        reg = store.rows('registro_modelo_operativo', select='storage_path', sha256='eq.' + row['modelo_sha256'])
+        if reg:
+            r = store.client.delete('/storage/v1/object/pulso-models/' + reg[0]['storage_path'])
+            removed += r.status_code == 200
+    return removed
+
+
 # ---------- orquestación ----------
-def run(force=False, trials_lgbm=40, trials_otros=12, budget_family=1800, dry_run=False, activation_wait=4.5 * 3600):
+def run(force=False, trials_lgbm=40, trials_otros=12, budget_family=1800, dry_run=False, activation_wait=4.5 * 3600,
+        refrescar=True):
     load_env(Path('.env'))
     store = RemoteStore()
     started = time.time()
@@ -204,21 +299,20 @@ def run(force=False, trials_lgbm=40, trials_otros=12, budget_family=1800, dry_ru
     check = store.rpc('necesita_reentreno')
     log(f"Disparo: {check['disparar']} ({check['motivo']})")
     if not (check['disparar'] or force):
-        return {'status': 'sin_disparo', 'motivo': check['motivo']}
+        if not refrescar or check['motivo'] == 'hay un modelo pendiente de activación':
+            store.close()
+            return {'status': 'sin_disparo', 'motivo': check['motivo']}
+        try:
+            return refresh(store, dry_run=dry_run, activation_wait=min(activation_wait, 80 * 60))
+        finally:
+            store.close()
     policy = check['politica']
     rid = None
     if not dry_run:
         rid = store.request('POST', '/rest/v1/reentreno', headers={'Prefer': 'return=representation'}, json={
             'disparo': check, 'github_run_id': os.getenv('GITHUB_RUN_ID')}).json()[0]['reentreno_id']
     try:
-        for attempt in range(3):
-            try:
-                actual, model_pivot, _, _ = bt.load_remote(); break
-            except Exception as exc:
-                log(f'Reintento de carga ({type(exc).__name__})'); time.sleep(20)
-        else:
-            raise RuntimeError('No se pudieron cargar los datos')
-        origins = bt.origins_for(actual, actual.index[0] + pd.Timedelta(days=1, hours=4))
+        actual, origins = load_data()
         cuts = bq.cortes(actual, origins)
         test = cuts[1].Xe.origin.drop_duplicates().tolist()
         active_model = store.load_model(store.active_model())
@@ -292,6 +386,50 @@ def run(force=False, trials_lgbm=40, trials_otros=12, budget_family=1800, dry_ru
         store.close()
 
 
+SESSION_MIN_REMAINING = 75 * 60  # una búsqueda completa + espera de ventana caben en este margen
+
+
+def next_slot(now, minute=10):
+    """Próximo minuto `minute` de una hora (inicio de la ventana segura)."""
+    slot = now.replace(minute=minute, second=0, microsecond=0)
+    return slot if slot > now else slot + pd.Timedelta(hours=1)
+
+
+def session(minutes, sleep=time.sleep, clock=lambda: datetime.now(timezone.utc), **kw):
+    """Una pasada por hora (activación pendiente, búsqueda completa o refresco) hasta agotar
+    la sesión. El cron de GitHub se retrasa o se salta horas; esta sesión no depende de él."""
+    deadline = clock() + pd.Timedelta(minutes=minutes)
+    outs = []
+    while (deadline - clock()).total_seconds() >= SESSION_MIN_REMAINING:
+        remaining = (deadline - clock()).total_seconds()
+        try:
+            out = run(activation_wait=min(4.5 * 3600, remaining - 10 * 60), **kw)
+        except Exception as exc:  # los logs son públicos: solo el tipo de error
+            out = {'status': 'error', 'error_type': type(exc).__name__}
+        log(f"Iteración: {out.get('status')} — {out.get('motivo', out.get('error_type', ''))}")
+        outs.append(out)
+        write_summary(out)
+        wake = next_slot(clock())
+        if (deadline - wake).total_seconds() < SESSION_MIN_REMAINING:
+            break
+        sleep((wake - clock()).total_seconds())
+    return {'status': 'sesion_terminada', 'iteraciones': len(outs)}
+
+
+def write_summary(out):
+    summary = os.getenv('GITHUB_STEP_SUMMARY')
+    if not summary:
+        return
+    with open(summary, 'a') as f:
+        if out.get('tabla') and out.get('decision'):
+            f.write(f"## Reentreno: {out['decision']}\n\n{out['motivo']}\n\n"
+                    f"Entregado hoy: {out['actual']['accuracy']:.1f} %\n\n| Modelo | Accuracy | MAE | MAPE | WAPE |\n|---|---|---|---|---|\n")
+            for r in sorted(out['tabla'], key=lambda r: -r['accuracy']):
+                f.write(f"| {r['familia']} | {r['accuracy']:.1f} % | {r['mae']:.1f} | {r['mape']:.1f} % | {100 * r['wape']:.1f} % |\n")
+        else:
+            f.write(f"- {datetime.now(timezone.utc):%H:%M} {out.get('status')}: {out.get('motivo', out.get('error_type', ''))}\n")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--forzar', action='store_true', help='Ignorar el disparo (pruebas manuales)')
@@ -299,16 +437,17 @@ def main():
     p.add_argument('--pruebas-lightgbm', type=int, default=40)
     p.add_argument('--pruebas-otros', type=int, default=12)
     p.add_argument('--presupuesto-familia', type=int, default=1800, help='Segundos máximos por familia')
+    p.add_argument('--sin-refresco', action='store_true', help='Sin disparo, no refrescar el modelo activo')
+    p.add_argument('--sesion', type=int, default=0, help='Minutos de sesión con una pasada por hora (0 = una pasada)')
     a = p.parse_args()
-    out = run(a.forzar, a.pruebas_lightgbm, a.pruebas_otros, a.presupuesto_familia, a.simular)
+    kw = dict(trials_lgbm=a.pruebas_lightgbm, trials_otros=a.pruebas_otros, budget_family=a.presupuesto_familia,
+              dry_run=a.simular, refrescar=not a.sin_refresco)
+    if a.sesion:
+        print(json.dumps(session(a.sesion, **kw), ensure_ascii=False))
+        return
+    out = run(a.forzar, **kw)
     print(json.dumps(out, ensure_ascii=False, default=str))
-    summary = os.getenv('GITHUB_STEP_SUMMARY')
-    if summary and out.get('tabla') and out.get('decision'):
-        with open(summary, 'a') as f:
-            f.write(f"## Reentreno: {out['decision']}\n\n{out['motivo']}\n\n"
-                    f"Entregado hoy: {out['actual']['accuracy']:.1f} %\n\n| Modelo | Accuracy | MAE | MAPE | WAPE |\n|---|---|---|---|---|\n")
-            for r in sorted(out['tabla'], key=lambda r: -r['accuracy']):
-                f.write(f"| {r['familia']} | {r['accuracy']:.1f} % | {r['mae']:.1f} | {r['mape']:.1f} % | {100 * r['wape']:.1f} % |\n")
+    write_summary(out)
 
 
 if __name__ == '__main__':

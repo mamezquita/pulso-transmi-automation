@@ -1,45 +1,73 @@
 name: Reentreno
-# Etapa 4. Corre aparte de las entregas: revisa cada hora si la política pide
-# reentrenar (accuracy de los últimos ciclos bajo el umbral, datos limpios, fuera
-# del periodo de espera). Si sí, búsqueda exhaustiva y activación segura.
+# Etapa 4. Corre aparte de las entregas, como sesión con relevo (el cron de GitHub se
+# retrasa o se salta horas). Cada hora, en la ventana segura: activa lo pendiente; si la
+# política lo pide, búsqueda exhaustiva; si no, refresca el modelo activo con los datos
+# más recientes (misma configuración, nueva revisión).
 on:
   workflow_dispatch:
     inputs:
       forzar:
-        description: 'Ignorar el disparo (prueba manual)'
+        description: 'Una sola pasada ignorando el disparo (prueba manual)'
         type: boolean
         default: false
+      minutes:
+        description: 'Duración de la sesión, 1..300 minutos'
+        type: number
+        default: 240
   schedule:
+    # Respaldo por si se corta la cadena de relevos.
     - cron: '14 * * * *'
 concurrency:
   group: reentreno
   cancel-in-progress: false
 permissions:
   contents: read
+  actions: write
 jobs:
   reentrenar:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 355
+    env:
+      AUTOMATION_UNTIL: ${{ vars.AUTOMATION_UNTIL }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Comprobar fecha de finalizacion
+        id: gate
+        env:
+          REQUESTED_MINUTES: ${{ inputs.minutes || 240 }}
+        run: python3 scripts/session_gate.py
+      - name: Reservar relevo desde el inicio
+        # Queda en cola por concurrency: si esta sesión muere, el relevo arranca solo.
+        if: steps.gate.outputs.enabled == 'true' && inputs.forzar != true
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run reentreno.yml --ref main -f minutes=240
       - uses: actions/setup-python@v5
+        if: steps.gate.outputs.enabled == 'true'
         with:
           python-version: '3.14'
           cache: pip
           cache-dependency-path: requirements-operativo.txt
       - name: Instalar runtime probado (mismas versiones que el envío)
+        if: steps.gate.outputs.enabled == 'true'
         run: |
           python -m pip install -r requirements-operativo.txt
           python -m pip install --no-deps .
-      - name: Verificar disparo y reentrenar
+      - name: Reentrenar o refrescar cada hora
+        if: steps.gate.outputs.enabled == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           FORZAR: ${{ inputs.forzar || false }}
+          MINUTES: ${{ steps.gate.outputs.minutes }}
         run: |
           cd "$RUNNER_TEMP"
-          args=()
-          if [ "$FORZAR" = "true" ]; then args+=(--forzar); fi
-          python -m pulso_transmi.reentreno "${args[@]}"
+          if [ "$FORZAR" = "true" ]; then
+            python -m pulso_transmi.reentreno --forzar
+          else
+            python -m pulso_transmi.reentreno --sesion "$MINUTES"
+          fi
