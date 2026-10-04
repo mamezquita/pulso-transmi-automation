@@ -8,7 +8,7 @@ y la forma anterior, así se ve exactamente qué cambió y cuándo. Nunca bloque
 import re
 
 _captured = {}
-LIST_SAMPLE = 5
+LIST_SAMPLE = 1000  # todas las filas de la página: el 3-oct el cambio venía después de las primeras
 SAMPLE_ROWS = 3
 
 

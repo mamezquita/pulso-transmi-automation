@@ -105,3 +105,12 @@ def test_known_field_names_never_trigger_content_inference(monkeypatch):
     import pulso_transmi.contract as contract
     monkeypatch.setattr(contract, '_infer_columns', lambda rows: (_ for _ in ()).throw(AssertionError('no debía inferir')))
     assert len(normalize_observations(PAGE['data'])[0]) == len(PAGE['data'])
+
+
+def test_real_schema2_rows_from_the_drift_are_read_and_missing_values_quarantined():
+    rows = json.loads((FIX / 'stream_schema2.json').read_text())
+    good, bad, _ = normalize_observations(rows)
+    assert len(good) == 188 and len(bad) == 4
+    assert all(b['row']['measurement']['quality'] == 'missing' for b in bad)
+    assert good[0] == {'station_id': '02300', 'observed_at': '2026-09-20T12:15:00Z', 'demand': 546,
+                       'released_at': '2026-10-03T23:19:15.124962Z'}

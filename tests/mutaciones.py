@@ -163,6 +163,12 @@ def stream_mutations(page):
     names = {'station_id': 'id_est', 'observed_at': 'ts', 'demand': 'valor', 'released_at': 'pub'}
     p = copy.deepcopy(page); p['data'] = [{names[k]: v for k, v in r.items()} for r in p['data']]
     out['campos_desconocidos'] = p
+    # Drift real del 3-oct (schema_version 2): demanda anidada como texto con decimales.
+    p = copy.deepcopy(page)
+    for r in p['data']:
+        r['measurement'] = {'unit': 'passengers', 'value': f"{r.pop('demand')}.00", 'quality': 'observed'}
+        r['schema_version'] = 2
+    out['demanda_anidada_schema2'] = p
     p = copy.deepcopy(page); p['rows'] = p.pop('data'); out['pagina_rows'] = p
     p = copy.deepcopy(page); out['pagina_anidada'] = {'result': {'data': p.pop('data'), **p}}
     p = copy.deepcopy(page); p['items'] = p.pop('data'); out['pagina_items'] = p

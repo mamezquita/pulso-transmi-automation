@@ -366,6 +366,20 @@ def _infer_columns(rows):
     return out
 
 
+def flatten(row):
+    """Sube un nivel los objetos anidados: {"measurement": {"value": 5}} agrega
+    `measurement.value` y, si no choca con un campo existente, también `value`."""
+    if not isinstance(row, dict) or not any(isinstance(v, dict) for v in row.values()):
+        return row
+    out = {k: v for k, v in row.items() if not isinstance(v, dict)}
+    for k, v in row.items():
+        if isinstance(v, dict):
+            for kk, vv in v.items():
+                out[f'{k}.{kk}'] = vv
+                out.setdefault(kk, vv)
+    return out
+
+
 def normalize_observations(rows, near=None):
     """Devuelve (filas_canónicas, cuarentena, huella). Nunca lanza por una fila.
 
@@ -374,6 +388,8 @@ def normalize_observations(rows, near=None):
     good, quarantine, fingerprint = [], [], {}
     staged = []
     inferred = None
+    originals = rows
+    rows = [flatten(r) for r in rows]  # schema 2 del stream: demanda en measurement.value
 
     def get_key(raw, name):
         nonlocal inferred
@@ -386,17 +402,17 @@ def normalize_observations(rows, near=None):
                 return inferred[name]
             raise
 
-    for raw in rows:
+    for original, raw in zip(originals, rows):
         try:
             if not isinstance(raw, dict):
                 raise ContractError('Fila no es un objeto')
             keys = {name: get_key(raw, name) for name in ALIASES}
-            staged.append((raw, station(raw[keys['station_id']]), count(raw[keys['demand']]),
+            staged.append((original, station(raw[keys['station_id']]), count(raw[keys['demand']]),
                            raw[keys['observed_at']], raw[keys['released_at']]))
             for name, key in keys.items():
                 fingerprint.setdefault(name, set()).add(f'{key}:{pattern(raw[key])}')
         except ContractError as exc:
-            quarantine.append({'row': raw, 'reason': str(exc)})
+            quarantine.append({'row': original, 'reason': str(exc)})
     if staged:
         try:
             observed = parse_instants([s[3] for s in staged], near=near)
