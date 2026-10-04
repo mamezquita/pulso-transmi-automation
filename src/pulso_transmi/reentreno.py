@@ -375,8 +375,16 @@ def run(force=False, trials_lgbm=40, trials_otros=12, budget_family=1800, dry_ru
                 'decision': decision, 'motivo': motivo, 'accuracy_actual': current['accuracy'],
                 'accuracy_elegido': chosen['prueba']['accuracy'] if chosen else None,
                 'version_mayor': version[0] if version else None, 'revision': version[1] if version else None})
-        return {'status': 'completado', 'decision': decision, 'motivo': motivo, 'actual': current,
-                'tabla': [{'familia': r['familia'], **r['prueba'], 'cv': r['cv_accuracy']} for r in table]}
+        out = {'status': 'completado', 'decision': decision, 'motivo': motivo, 'actual': current,
+               'tabla': [{'familia': r['familia'], **r['prueba'], 'cv': r['cv_accuracy']} for r in table]}
+        if decision == 'sin_cambio' and refrescar and not dry_run:
+            # Ningún candidato gana, pero el modelo activo igual debe ver los datos nuevos.
+            try:
+                remaining = max(0, activation_wait - (time.time() - started))
+                out['refresco'] = refresh(store, activation_wait=min(remaining, 80 * 60)).get('status')
+            except Exception as exc:
+                out['refresco'] = f'error:{type(exc).__name__}'
+        return out
     except Exception as exc:
         if rid is not None:
             store.request('PATCH', '/rest/v1/reentreno', params={'reentreno_id': f'eq.{rid}'}, json={
