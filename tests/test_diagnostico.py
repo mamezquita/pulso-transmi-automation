@@ -60,7 +60,7 @@ def test_flush_records_each_source_once_with_small_sample_and_isolates_errors():
     assert diagnostico.flush(store) == {}  # se limpia tras registrar
 
 
-def test_end_of_stream_null_cursor_is_not_a_format_change():
+def test_pagination_cursor_is_not_a_format_change():
     with_cursor = {**PAGE, 'next_cursor': 'WyIyMDI2LTA5LTIxVDE1OjMwOjA0Ljk1ODA0OSswMDowMCIsIjIwMjYtMDktMDlUMDU6MDA'}
-    assert diagnostico.shape({**PAGE, 'next_cursor': None}) == {k: v for k, v in diagnostico.shape(with_cursor).items()
-                                                               if k != 'next_cursor'}
+    assert diagnostico.shape({**PAGE, 'next_cursor': None}) == diagnostico.shape(with_cursor)
+    assert diagnostico.shape({k: v for k, v in PAGE.items() if k != 'next_cursor'}) == diagnostico.shape(with_cursor)

@@ -127,6 +127,24 @@ def cycle_mutations(raw):
         out[name] = c
     c = copy.deepcopy(raw); c['items'] = c.pop('targets'); out['targets_como_items'] = c
     c = copy.deepcopy(raw); out['ciclo_envuelto'] = {'data': c}
+    # Schema 2 del ciclo (como el del stream del 3-oct): objetos anidados y valores envueltos.
+    c = copy.deepcopy(raw)
+    c['targets'] = [{'station': {'id': t['station_id']}, 'target': {'at': t['target_at']},
+                     'horizon': {'minutes': t['horizon_minutes']}} for t in c['targets']]
+    c['schema_version'] = 2
+    out['ciclo_schema2_targets_anidados'] = c
+    c = copy.deepcopy(raw)
+    c['cycle'] = {'id': c.pop('cycle_id'), 'state': c.pop('state')}
+    c['window'] = {'opens_at': c.pop('opens_at'), 'closes_at': c.pop('closes_at')}
+    out['ciclo_schema2_secciones'] = c
+    c = copy.deepcopy(raw)
+    for t in c['targets']:
+        t['horizon_minutes'] = {'value': t['horizon_minutes'], 'unit': 'minutes'}
+    c['expected_predictions'] = {'value': c['expected_predictions']}
+    out['ciclo_valores_envueltos'] = c
+    c = copy.deepcopy(raw); c['status'] = c.pop('state'); out['ciclo_status'] = c
+    c = copy.deepcopy(raw); c['id'] = c.pop('cycle_id'); out['ciclo_id_corto'] = c
+    c = copy.deepcopy(raw); del c['expected_predictions']; out['ciclo_sin_expected'] = c
     c = copy.deepcopy(raw); c['state'] = 'OPEN'; out['estado_mayusculas'] = c
     c = copy.deepcopy(raw); c['state'] = True; out['estado_booleano'] = c
     c = copy.deepcopy(raw); c['state'] = 'yes'; out['estado_yes'] = c
@@ -169,6 +187,11 @@ def stream_mutations(page):
         r['measurement'] = {'unit': 'passengers', 'value': f"{r.pop('demand')}.00", 'quality': 'observed'}
         r['schema_version'] = 2
     out['demanda_anidada_schema2'] = p
+    p = copy.deepcopy(page)
+    for r in p['data']:
+        d = r.pop('demand')
+        r['measurement'] = {'unit': 'hundreds', 'value': f'{d / 100:.2f}', 'quality': 'observed'}
+    out['demanda_en_cientos'] = p
     p = copy.deepcopy(page); p['rows'] = p.pop('data'); out['pagina_rows'] = p
     p = copy.deepcopy(page); out['pagina_anidada'] = {'result': {'data': p.pop('data'), **p}}
     p = copy.deepcopy(page); p['items'] = p.pop('data'); out['pagina_items'] = p

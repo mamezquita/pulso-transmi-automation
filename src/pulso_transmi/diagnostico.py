@@ -40,6 +40,8 @@ def shape(obj, prefix=''):
     out = {}
     if isinstance(obj, dict):
         for k, v in obj.items():
+            if 'cursor' in str(k).lower():  # paginación: aparece y desaparece, no es formato
+                continue
             for path, pat in shape(v, f'{prefix}.{k}' if prefix else str(k)).items():
                 out[path] = pat
     elif isinstance(obj, list):

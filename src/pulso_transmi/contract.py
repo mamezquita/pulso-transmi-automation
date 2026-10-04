@@ -294,6 +294,8 @@ def field(row, name):
     return row[field_key(row, name)]
 
 
+MISSING_QUALITY = {'missing', 'faltante', 'null', 'na', 'n/a', 'unavailable'}
+MISSING_REASON = 'Valor faltante reportado por la API'
 PAGE_ROWS = ('data', 'items', 'results', 'rows', 'records', 'observations', 'observaciones')
 
 
@@ -377,7 +379,33 @@ def flatten(row):
             for kk, vv in v.items():
                 out[f'{k}.{kk}'] = vv
                 out.setdefault(kk, vv)
+            wrapped = next((v[w] for w in ('value', 'valor') if w in v), None)
+            if wrapped is not None and not isinstance(wrapped, (dict, list)):
+                out.setdefault(k, wrapped)  # {"horizon_minutes": {"value": 15}} -> 15
     return out
+
+
+UNITS = {'passengers': 1, 'pasajeros': 1, 'pax': 1, 'personas': 1, 'people': 1, 'count': 1, 'unidades': 1,
+         'hundreds': 100, 'cientos': 100, 'centenas': 100, 'thousands': 1000, 'miles': 1000, 'k': 1000}
+
+
+def scaled_count(value, unit):
+    """Demanda en pasajeros aunque venga en otra unidad conocida ("5.46" cientos -> 546).
+    Una unidad desconocida no se adivina: va a cuarentena."""
+    if unit is None:
+        return count(value)
+    factor = UNITS.get(re.sub(r'[^a-z]', '', str(unit).lower()))
+    if factor is None:
+        raise ContractError(f'Unidad desconocida: {unit}')
+    if factor == 1:
+        return count(value)
+    try:
+        number = float(str(value).strip().replace(',', '.')) * factor
+    except ValueError:
+        raise ContractError('Demanda inválida')
+    if not math.isfinite(number) or number < 0 or abs(number - round(number)) > 1e-6 * max(1, number):
+        raise ContractError('Demanda inválida')
+    return int(round(number))
 
 
 def normalize_observations(rows, near=None):
@@ -406,8 +434,10 @@ def normalize_observations(rows, near=None):
         try:
             if not isinstance(raw, dict):
                 raise ContractError('Fila no es un objeto')
+            if str(raw.get('quality', '')).strip().lower() in MISSING_QUALITY and raw.get('value') is None:
+                raise ContractError(MISSING_REASON)  # la API reporta el dato como faltante
             keys = {name: get_key(raw, name) for name in ALIASES}
-            staged.append((original, station(raw[keys['station_id']]), count(raw[keys['demand']]),
+            staged.append((original, station(raw[keys['station_id']]), scaled_count(raw[keys['demand']], raw.get('unit')),
                            raw[keys['observed_at']], raw[keys['released_at']]))
             for name, key in keys.items():
                 fingerprint.setdefault(name, set()).add(f'{key}:{pattern(raw[key])}')
@@ -442,6 +472,14 @@ def _unwrap_cycle(raw, depth=0):
         inner = [v for v in c.values() if isinstance(v, dict) and 'cycleid' in {norm_key(k) for k in v}]
         if len(inner) == 1:
             return _unwrap_cycle(inner[0], 1)
+    c = canonical_keys(flatten(c), CYCLE_FIELDS)  # secciones anidadas: {"cycle": {"id": …}}
+    if 'cycle_id' not in c and isinstance(c.get('id'), str):
+        c['cycle_id'] = c['id']
+    if 'state' not in c:
+        for alt in ('status', 'estado', 'is_open', 'open', 'abierto'):
+            if alt in c:
+                c['state'] = c[alt]
+                break
     if not isinstance(c.get('targets'), list):
         named = {norm_key(n) for n in TARGET_LISTS}
         found = [k for k, v in c.items() if norm_key(k) in named and isinstance(v, list)]
@@ -468,7 +506,7 @@ def normalize_cycle_contract(raw):
     c['state'] = 'open' if state is True else 'closed' if state is False else str(c.get('state', '')).strip().lower()
     ref = _cycle_reference(c['cycle_id'])
     sim_keys = [k for k in ('data_cutoff', 'origin_at', 'forecast_start_at', 'forecast_end_at') if c.get(k) is not None]
-    targets = [canonical_keys(dict(t), TARGET_FIELDS) for t in c['targets']]
+    targets = [canonical_keys(flatten(dict(t)), TARGET_FIELDS) for t in c['targets']]
     try:
         parsed = parse_instants([c[k] for k in sim_keys] + [t.get('target_at') for t in targets], near=ref)
     except ContractError as exc:
@@ -495,6 +533,8 @@ def normalize_cycle_contract(raw):
     for k in ('expected_predictions', 'station_count'):
         if k in c:
             c[k] = count(c[k])
+    if 'expected_predictions' not in c:
+        c['expected_predictions'] = len(targets)  # cada objetivo es una predicción esperada
     for k in ('opens_at', 'closes_at'):
         if c.get(k) is None:
             continue

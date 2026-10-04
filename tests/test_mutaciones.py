@@ -112,5 +112,21 @@ def test_real_schema2_rows_from_the_drift_are_read_and_missing_values_quarantine
     good, bad, _ = normalize_observations(rows)
     assert len(good) == 188 and len(bad) == 4
     assert all(b['row']['measurement']['quality'] == 'missing' for b in bad)
+    assert {b['reason'] for b in bad} == {'Valor faltante reportado por la API'}
     assert good[0] == {'station_id': '02300', 'observed_at': '2026-09-20T12:15:00Z', 'demand': 546,
                        'released_at': '2026-10-03T23:19:15.124962Z'}
+
+
+def test_unknown_demand_unit_goes_to_quarantine_instead_of_guessing():
+    p = copy.deepcopy(PAGE)
+    for r in p['data']:
+        r['measurement'] = {'unit': 'docenas', 'value': str(r.pop('demand')), 'quality': 'observed'}
+    good, bad, _ = normalize_observations(p['data'])
+    assert good == [] and {b['reason'] for b in bad} == {'Unidad desconocida: docenas'}
+
+
+def test_nested_section_never_overrides_a_top_level_field():
+    c = copy.deepcopy(CYCLE)
+    c['meta'] = {'state': 'closed', 'cycle_id': 'otro'}
+    out = normalize_cycle_contract(c)
+    assert out['state'] == 'open' and out['cycle_id'] == CYCLE['cycle_id']

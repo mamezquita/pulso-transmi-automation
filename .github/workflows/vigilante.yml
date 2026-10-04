@@ -1,6 +1,8 @@
 name: Vigilante
 # Independiente de las entregas: si la cadena de sesiones muere, la relanza.
 # Si falla (rojo), GitHub envía correo: revisar Actions.
+# Salud de datos (observaciones/modelo atrasados, cuarentena, formato de la API):
+# abre un issue "[Alerta] ..." por cada problema y lo cierra cuando se resuelve.
 on:
   workflow_dispatch:
   schedule:
@@ -11,6 +13,7 @@ concurrency:
 permissions:
   contents: read
   actions: write
+  issues: write
 jobs:
   revisar:
     runs-on: ubuntu-latest
@@ -25,6 +28,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           AUTOMATION_UNTIL: ${{ vars.AUTOMATION_UNTIL }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/watchdog.py
       - name: Relanzar sesion caida
         if: steps.diag.outputs.status == 'stalled'
