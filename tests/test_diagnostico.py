@@ -64,3 +64,17 @@ def test_pagination_cursor_is_not_a_format_change():
     with_cursor = {**PAGE, 'next_cursor': 'WyIyMDI2LTA5LTIxVDE1OjMwOjA0Ljk1ODA0OSswMDowMCIsIjIwMjYtMDktMDlUMDU6MDA'}
     assert diagnostico.shape({**PAGE, 'next_cursor': None}) == diagnostico.shape(with_cursor)
     assert diagnostico.shape({k: v for k, v in PAGE.items() if k != 'next_cursor'}) == diagnostico.shape(with_cursor)
+
+
+def test_data_values_do_not_look_like_format_changes():
+    # 4-oct: falsas alarmas por cifras de la demanda y por filas "missing" en unas páginas y no en otras.
+    row = lambda v, q: {'station_id': '02300', 'measurement': {'unit': 'passengers', 'value': v, 'quality': q}}
+    a = {'data': [row('546.00', 'observed'), row('61.00', 'observed')]}
+    b = {'data': [row('1234.00', 'observed'), row(None, 'missing')]}
+    assert diagnostico.shape(a) == diagnostico.shape(b)
+
+
+def test_zero_padding_and_decimals_still_count_as_format():
+    assert diagnostico.shape({'s': '02300'}) != diagnostico.shape({'s': '2300'})
+    assert diagnostico.shape({'v': '546.00'}) != diagnostico.shape({'v': '546'})
+    assert diagnostico.shape({'v': '546,00'}) != diagnostico.shape({'v': '546.00'})

@@ -27,6 +27,11 @@ def _scalar(value):
     if isinstance(value, float):
         return 'float'
     text = str(value)
+    m = re.fullmatch(r'(\s*)-?(\d+)(?:([.,])(\d+))?(\s*)', text)
+    if m:  # número como texto: importa su formato (ceros a la izquierda, decimales), no su valor
+        lead, digits, sep, frac, trail = m.groups()
+        tag = f'num0w{len(digits)}' if len(digits) > 1 and digits.startswith('0') else 'num'
+        return f"str:{'_' if lead or trail else ''}{tag}{(sep + str(len(frac))) if sep else ''}"
     if len(text) > 60:
         return 'texto-largo'
     if len(text) <= 20 and not re.search(r'\d', text):
@@ -49,7 +54,8 @@ def shape(obj, prefix=''):
         for item in obj[:LIST_SAMPLE]:
             for path, pat in shape(item, prefix + '[]').items():
                 merged.setdefault(path, set()).add(pat)
-        out = {p: '|'.join(sorted(v)) for p, v in merged.items()}
+        # En listas, las categorías cuentan como texto: qué valores aparecen depende de los datos.
+        out = {p: '|'.join(sorted({'txt' if x.startswith('txt=') else x for x in v})) for p, v in merged.items()}
     elif obj is not None:  # nulos (p. ej. next_cursor al final) no son un cambio de formato
         out[prefix or '.'] = _scalar(obj)
     return out
