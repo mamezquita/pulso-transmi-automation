@@ -96,6 +96,11 @@ def sync_versions(client):
         rid = run.info.run_id
         client.set_tag(rid, 'estado', v['estado'])
         client.set_tag(rid, 'activa', str(v['version'] == active).lower())
+        if v['metodo'] == 'modelo_sombra':  # qué modelo sombra está midiendo ahora
+            shadow = rows('modelo_sombra', select='modelo_sha256,actualizado_en', nombre=f"eq.{v['parametros'].get('nombre')}")
+            if shadow:
+                client.set_tag(rid, 'modelo_sombra', shadow[0]['modelo_sha256'][:16])
+                client.set_tag(rid, 'modelo_sombra_actualizado', shadow[0]['actualizado_en'])
         metrics = {}
         ver = verdict.get(v['version'], {})
         for k in ('mae', 'mae_entregado', 'mejora_pct', 'ciclos_ganados_pct', 'ciclos_en_vivo'):
@@ -182,8 +187,11 @@ def sync_model_versions(client):
         key = f"{v['version_mayor']}.r{v['revision']}"
         run = find_run(client, exp, 'modelo_version', key)
         if run is None:
-            run = client.create_run(exp, run_name=f"modelo {v['version_mayor']} r{v['revision']} ({fams.get(v['version_mayor'], '?')})",
-                                    tags={'modelo_version': key, 'tipo': 'version_modelo', 'mlflow.note.content': v['motivo']})
+            origen = (v['config'] or {}).get('origen', 'busqueda')  # 'refresco' = misma configuración, datos nuevos
+            suffix = ', refresco' if origen == 'refresco' else ''
+            run = client.create_run(exp, run_name=f"modelo {v['version_mayor']} r{v['revision']} ({fams.get(v['version_mayor'], '?')}{suffix})",
+                                    tags={'modelo_version': key, 'tipo': 'version_modelo', 'origen': origen,
+                                          'mlflow.note.content': v['motivo']})
             for k, x in {**v['config'], 'modelo_sha256': v['modelo_sha256'][:16]}.items():
                 client.log_param(run.info.run_id, k, json.dumps(x) if isinstance(x, (list, dict)) else x)
             vals = [Metric(clean(k), float(x), int(time.time() * 1000), 0) for k, x in (v['metricas'] or {}).items()
