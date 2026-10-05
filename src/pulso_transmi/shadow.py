@@ -91,6 +91,7 @@ def ratio_estacional(base, targets, history, model, cutoff, *, ventana_obs=2, pe
 
 METHODS = {'modelo_base': modelo_base, 'ratio_ultima_hora': ratio_ultima_hora,
            'ratio_conjunto': ratio_conjunto, 'ratio_estacional': ratio_estacional}
+MODEL_METHODS = {'modelo_sombra'}  # versiones que predicen con otro modelo registrado
 BASE_VERSION = '1.0'  # version_sombra con metodo modelo_base: lo que se envía si algo falla
 
 
@@ -145,8 +146,8 @@ def run_shadow(store, cycle):
     versions = [v for v in store.shadow_versions() if v['estado'] == 'sombra']
     done = store.shadow_done(cycle['cycle_id'])
     pending = [v for v in versions if v['version'] not in done]
-    unknown = sorted(v['version'] for v in pending if v['metodo'] not in METHODS)
-    pending = [v for v in pending if v['metodo'] in METHODS]
+    unknown = sorted(v['version'] for v in pending if v['metodo'] not in METHODS and v['metodo'] not in MODEL_METHODS)
+    pending = [v for v in pending if v['metodo'] in METHODS or v['metodo'] in MODEL_METHODS]
     if not pending:
         return {'status': 'up_to_date', 'unknown_method': unknown}
     record = store.active_model()
@@ -157,12 +158,21 @@ def run_shadow(store, cycle):
     history = load_history(store, cutoff, max(lookback(v['parametros']) for v in pending))
     computed = []
     for v in pending:
-        values, diag = METHODS[v['metodo']](base, targets, history, model, cutoff, **v['parametros'])
+        sha = record['sha256']
+        if v['metodo'] in MODEL_METHODS:
+            # Otro modelo registrado (p. ej. la combinación sombra): predice igual que el activo.
+            shadow = store.shadow_model(v['parametros']['nombre'])
+            if shadow is None:
+                continue
+            values = base_predictions(store, store.load_model(shadow), targets, cutoff)
+            diag, sha = {'modelo': shadow['version']}, shadow['sha256']
+        else:
+            values, diag = METHODS[v['metodo']](base, targets, history, model, cutoff, **v['parametros'])
         if not np.isfinite(values).all():
             raise ValueError(f"Versión {v['version']} produjo valores no finitos")
         store.save_shadow({
             'ciclo_id': cycle['cycle_id'], 'version': v['version'],
-            'modelo_sha256': record['sha256'], 'codigo': os.getenv('GITHUB_SHA'),
+            'modelo_sha256': sha, 'codigo': os.getenv('GITHUB_SHA'),
             'data_cutoff': cycle['data_cutoff'], 'diagnostico': diag,
             'predicciones': [{'station_id': s, 'target_at': t, 'value': float(x)}
                              for s, t, x in zip(targets.station_id, targets.target_at, values)]})

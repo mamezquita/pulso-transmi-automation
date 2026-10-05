@@ -82,7 +82,7 @@ COMMON = {'feature_set': list(FEATURE_SETS), 'objetivo': ['relativo', 'directo']
           'vida_media_dias': [None, 1, 2, 4]}
 MODEL_KEYS = set(COMMON)
 # Metadatos guardados junto a la configuración (no son hiperparámetros).
-META_KEYS = {'familia', 'correccion', 'origen', 'refresco_de'}
+META_KEYS = {'familia', 'correccion', 'origen', 'refresco_de', 'sombra'}
 
 
 def split(origins, folds=3):

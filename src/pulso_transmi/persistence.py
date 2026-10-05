@@ -123,6 +123,18 @@ class RemoteStore:
         return [{'station_id': r['estacion_id'], 'observed_at': r['observado_en'], 'demand': r['demanda']}
                 for r in rows]
 
+    def shadow_model(self, name):
+        """Registro del modelo sombra `name` (None si aún no existe)."""
+        rows = self.rows('modelo_sombra', select='modelo_sha256,familia,config', nombre='eq.' + name)
+        if not rows:
+            return None
+        rec = self.rows('registro_modelo_operativo', sha256='eq.' + rows[0]['modelo_sha256'])[0]
+        return {**rec, 'familia': rows[0]['familia'], 'config': rows[0]['config']}
+
+    def set_shadow_model(self, row):
+        self.request('POST', '/rest/v1/modelo_sombra', params={'on_conflict': 'nombre'},
+                     headers={'Prefer': 'resolution=merge-duplicates'}, json=row)
+
     def save_shadow(self, row):
         self.request('POST', '/rest/v1/pronostico_sombra', params={'on_conflict': 'ciclo_id,version'},
                      headers={'Prefer': 'resolution=ignore-duplicates'}, json=row)

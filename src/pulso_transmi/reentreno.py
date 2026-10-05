@@ -112,7 +112,8 @@ def decide(policy, current, lgbm, others):
 
 
 # ---------- registro y activación ----------
-def publish(store, model, version_mayor, revision, familia, result, motivo):
+def upload_artifact(store, model, version, familia, result, kind='historia'):
+    """Sube el artefacto (idempotente por SHA-256), lo registra y verifica la descarga."""
     buf = io.BytesIO(); joblib.dump(model, buf, compress=3)
     content = buf.getvalue(); digest = hashlib.sha256(content).hexdigest()
     path = f'{digest}/model.joblib'
@@ -122,9 +123,8 @@ def publish(store, model, version_mayor, revision, familia, result, motivo):
                       headers={'Content-Type': 'application/octet-stream', 'x-upsert': 'false'})
     elif existing.status_code != 200 or hashlib.sha256(existing.content).hexdigest() != digest:
         raise ValueError('Artefacto remoto inconsistente')
-    version = f'm{version_mayor}-{familia}-r{revision}'
     metadata = {'training_data_end': model.end, 'trained_at': datetime.now(timezone.utc).isoformat(),
-                'training_rows': model.n_train, 'kind': 'historia', 'familia': familia,
+                'training_rows': model.n_train, 'kind': kind, 'familia': familia,
                 'versions': {k: importlib.metadata.version(k) for k in RUNTIME_PACKAGES},
                 'python': platform.python_version(), 'config': result['config'],
                 'validation': {'cv_accuracy': result['cv_accuracy'], 'pliegues': result['pliegues'], 'prueba': result['prueba']}}
@@ -134,11 +134,86 @@ def publish(store, model, version_mayor, revision, familia, result, motivo):
     loaded = store.load_model(row)  # confirma descarga, hash y versiones antes de activar
     if loaded.end != model.end:
         raise ValueError('El artefacto descargado no coincide')
+    return digest, row
+
+
+def publish(store, model, version_mayor, revision, familia, result, motivo):
+    version = f'm{version_mayor}-{familia}-r{revision}'
+    digest, _ = upload_artifact(store, model, version, familia, result)
     store.request('POST', '/rest/v1/version_modelo', json={
         'version_mayor': version_mayor, 'revision': revision, 'modelo_sha256': digest,
         'config': {**result['config'], 'familia': familia, 'correccion': '1.0'},
         'metricas': {'cv_accuracy': result['cv_accuracy'], **result['prueba']}, 'motivo': motivo})
     return digest, version
+
+
+# ---------- modelo sombra (se mide en vivo, nunca se envía) ----------
+SHADOW_NAME = bq.COMBINATION
+SHADOW_FAMILIES = ('gradient_boosting', 'red_neuronal')
+
+
+def publish_shadow(store, model, result, name=SHADOW_NAME):
+    """Registra el modelo sombra y reemplaza el anterior (su artefacto se borra del storage)."""
+    version = f"sombra-{name}-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}"
+    previous = store.shadow_model(name)
+    digest, _ = upload_artifact(store, model, version, model.familia, result, kind='sombra')
+    store.set_shadow_model({'nombre': name, 'modelo_sha256': digest, 'familia': model.familia,
+                            'config': result['config'], 'metricas': {'cv_accuracy': result.get('cv_accuracy'),
+                                                                      **(result.get('prueba') or {})},
+                            'actualizado_en': datetime.now(timezone.utc).isoformat()})
+    if previous and previous['sha256'] != digest:
+        store.client.delete('/storage/v1/object/pulso-models/' + previous['storage_path'])
+    return version
+
+
+def refresh_shadow(store, name=SHADOW_NAME):
+    """El modelo sombra se refresca igual que el activo, para que la comparación sea justa."""
+    rec = store.shadow_model(name)
+    if rec is None:
+        return 'sin_modelo_sombra'
+    current = store.load_model(rec)
+    actual, origins = load_data()
+    if actual.dropna(how='all').index.max() < pd.Timestamp(current.end) + REFRESH_MIN_NEW_DATA:
+        return 'al_dia'
+    model = bq.build_model(rec['familia'], rec['config']).fit(actual, origins)
+    meta = rec.get('metadata') or {}
+    result = {'config': rec['config'], 'cv_accuracy': (meta.get('validation') or {}).get('cv_accuracy'),
+              'pliegues': None, 'prueba': (meta.get('validation') or {}).get('prueba') or {}}
+    log(f'Modelo sombra refrescado: {publish_shadow(store, model, result, name)}')
+    return 'refrescado'
+
+
+def save_candidate(store, rid, r, chosen=False):
+    store.request('POST', '/rest/v1/candidato_reentreno', json={
+        'reentreno_id': rid, 'familia': r['familia'], 'config': r['config'],
+        'cv_accuracy': r['cv_accuracy'], 'pliegues': r['pliegues'], 'accuracy': r['prueba']['accuracy'],
+        'wape': r['prueba']['wape'], 'mae': r['prueba']['mae'], 'mape': r['prueba']['mape'],
+        'predicciones': r['prueba']['n'], 'pruebas': r['pruebas_realizadas'], 'segundos': r['segundos'],
+        'elegido': chosen})
+
+
+def shadow_search(store, rid, cuts, actual, origins, lgbm, others, chosen_family, trials, budget):
+    """Aunque la política no pruebe otras familias (LightGBM ≥ umbral), se buscan las mejores
+    y su combinación solo para medirlas en sombra; la decisión de activación no cambia."""
+    results, new = [lgbm] + [r for r in others if r['familia'] != bq.COMBINATION], []
+    if not others:
+        for fam in SHADOW_FAMILIES:
+            res, _ = bq.search_family(cuts, fam, trials=trials, time_budget=budget, log=log)
+            res['config'] = {**res['config'], 'sombra': True}
+            results.append(res); new.append(res)
+    combo = next((r for r in others if r['familia'] == bq.COMBINATION), None)
+    if combo is None:
+        combo = bq.search_combination(cuts, results, log=log)
+        if combo:
+            combo['config'] = {**combo['config'], 'sombra': True}
+            new.append(combo)
+    for r in new:
+        save_candidate(store, rid, r)
+    if combo is None or chosen_family == bq.COMBINATION:
+        return 'sin_sombra'
+    log(f"Combinación en sombra: prueba {combo['prueba']['accuracy']:.2f} % (LightGBM {lgbm['prueba']['accuracy']:.2f} %)")
+    model = bq.build_model(bq.COMBINATION, combo['config']).fit(actual, origins)
+    return publish_shadow(store, model, combo)
 
 
 def safe_now(store, now, open_cycle):
@@ -205,6 +280,17 @@ REFRESH_KEEP_HOURS = 48
 
 
 def refresh(store, dry_run=False, activation_wait=80 * 60):
+    """Refresca el modelo activo y, después, el modelo sombra (aislado: nunca bloquea)."""
+    out = refresh_active(store, dry_run=dry_run, activation_wait=activation_wait)
+    if not dry_run:
+        try:
+            out['sombra'] = refresh_shadow(store)
+        except Exception as exc:
+            out['sombra'] = f'error:{type(exc).__name__}'
+    return out
+
+
+def refresh_active(store, dry_run=False, activation_wait=80 * 60):
     """Misma configuración del modelo activo, reentrenada con los datos más recientes.
     El ruido cambia rápido: un modelo con datos de 12 h atrás perdió 11 puntos en la
     prueba (2-oct). Queda como nueva revisión del mismo modelo, activada en ventana segura."""
@@ -279,7 +365,7 @@ def purge_old_refreshes(store, keep_hours=REFRESH_KEEP_HOURS, now=None):
 
 # ---------- orquestación ----------
 def run(force=False, trials_lgbm=40, trials_otros=12, budget_family=1800, dry_run=False, activation_wait=4.5 * 3600,
-        refrescar=True):
+        refrescar=True, trials_sombra=8):
     load_env(Path('.env'))
     store = RemoteStore()
     started = time.time()
@@ -337,12 +423,7 @@ def run(force=False, trials_lgbm=40, trials_otros=12, budget_family=1800, dry_ru
         table = [lgbm] + others
         if not dry_run:
             for r in table:
-                store.request('POST', '/rest/v1/candidato_reentreno', json={
-                    'reentreno_id': rid, 'familia': r['familia'], 'config': r['config'],
-                    'cv_accuracy': r['cv_accuracy'], 'pliegues': r['pliegues'], 'accuracy': r['prueba']['accuracy'],
-                    'wape': r['prueba']['wape'], 'mae': r['prueba']['mae'], 'mape': r['prueba']['mape'],
-                    'predicciones': r['prueba']['n'], 'pruebas': r['pruebas_realizadas'], 'segundos': r['segundos'],
-                    'elegido': r is chosen})
+                save_candidate(store, rid, r, chosen=r is chosen)
         version = None
         if decision != 'sin_cambio' and not dry_run:
             families = {f['familia']: f['version_mayor'] for f in store.rows('familia_modelo')}
@@ -377,6 +458,12 @@ def run(force=False, trials_lgbm=40, trials_otros=12, budget_family=1800, dry_ru
                 'version_mayor': version[0] if version else None, 'revision': version[1] if version else None})
         out = {'status': 'completado', 'decision': decision, 'motivo': motivo, 'actual': current,
                'tabla': [{'familia': r['familia'], **r['prueba'], 'cv': r['cv_accuracy']} for r in table]}
+        if not dry_run:
+            try:
+                out['sombra'] = shadow_search(store, rid, cuts, actual, origins, lgbm, others, familia,
+                                              trials=trials_sombra, budget=budget_family)
+            except Exception as exc:  # la sombra nunca afecta la decisión ni la activación
+                out['sombra'] = f'error:{type(exc).__name__}'
         if decision == 'sin_cambio' and refrescar and not dry_run:
             # Ningún candidato gana, pero el modelo activo igual debe ver los datos nuevos.
             try:
